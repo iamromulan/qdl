@@ -18,12 +18,14 @@ jobs:
             build-base \
             git \
             libxml2-dev \
+            libxml2-static \
             libusb-dev \
             zlib-static \
             xz-dev \
             pkgconf \
             linux-headers \
-            eudev-dev
+            eudev-dev \
+            eudev-libs
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,10 +37,21 @@ jobs:
 
       - name: Build static binary
         run: |
-          # Build with static linking - need to add all transitive dependencies
-          STATIC_LIBS=$(pkg-config --libs --static libxml-2.0 libusb-1.0)
-          echo "Static libs: $STATIC_LIBS"
-          make LDFLAGS="-static $STATIC_LIBS -ludev -lpthread"
+          # Debug: show available static libs
+          echo "=== Available static libraries ==="
+          find /usr -name "libusb*.a" -o -name "libxml*.a" -o -name "libudev*.a" 2>/dev/null || true
+
+          # Debug: show pkg-config output
+          echo "=== pkg-config libusb-1.0 --libs --static ==="
+          pkg-config --libs --static libusb-1.0 || echo "pkg-config failed for libusb"
+
+          echo "=== pkg-config libxml-2.0 --libs --static ==="
+          pkg-config --libs --static libxml-2.0 || echo "pkg-config failed for libxml2"
+
+          # Build - let pkg-config find the right flags, add missing deps
+          LIBS=$(pkg-config --libs --static libxml-2.0 libusb-1.0 2>/dev/null || echo "-lxml2 -lusb-1.0")
+          echo "Using LIBS: $LIBS"
+          make LDFLAGS="-static $LIBS -ludev -lpthread"
 
       - name: Verify static linking
         run: |
@@ -71,12 +84,14 @@ jobs:
             build-base \
             git \
             libxml2-dev \
+            libxml2-static \
             libusb-dev \
             zlib-static \
             xz-dev \
             pkgconf \
             linux-headers \
-            eudev-dev
+            eudev-dev \
+            eudev-libs
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -88,10 +103,21 @@ jobs:
 
       - name: Build static binary
         run: |
-          # Build with static linking - need to add all transitive dependencies
-          STATIC_LIBS=$(pkg-config --libs --static libxml-2.0 libusb-1.0)
-          echo "Static libs: $STATIC_LIBS"
-          make LDFLAGS="-static $STATIC_LIBS -ludev -lpthread"
+          # Debug: show available static libs
+          echo "=== Available static libraries ==="
+          find /usr -name "libusb*.a" -o -name "libxml*.a" -o -name "libudev*.a" 2>/dev/null || true
+
+          # Debug: show pkg-config output
+          echo "=== pkg-config libusb-1.0 --libs --static ==="
+          pkg-config --libs --static libusb-1.0 || echo "pkg-config failed for libusb"
+
+          echo "=== pkg-config libxml-2.0 --libs --static ==="
+          pkg-config --libs --static libxml-2.0 || echo "pkg-config failed for libxml2"
+
+          # Build - let pkg-config find the right flags, add missing deps
+          LIBS=$(pkg-config --libs --static libxml-2.0 libusb-1.0 2>/dev/null || echo "-lxml2 -lusb-1.0")
+          echo "Using LIBS: $LIBS"
+          make LDFLAGS="-static $LIBS -ludev -lpthread"
 
       - name: Verify static linking
         run: |
@@ -152,83 +178,27 @@ jobs:
         shell: msys2 {0}
         run: make tests
 
-      - name: Download Enigma Virtual Box
-        shell: pwsh
-        run: |
-          Invoke-WebRequest -Uri "https://enigmaprotector.com/assets/files/enigmavb.exe" -OutFile "enigmavb_setup.exe"
-          Start-Process -FilePath "enigmavb_setup.exe" -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" -Wait
-
-      - name: Bundle into single EXE
+      - name: Package
         shell: pwsh
         run: |
           $MSYS2_LOCATION = "${{ steps.msys2.outputs.msys2-location }}"
           $BIN_DIR = Join-Path $MSYS2_LOCATION "mingw64\bin"
-          $BuildDir = "build"
-          New-Item -ItemType Directory -Path $BuildDir | Out-Null
+          $DistDir = "dist"
+          New-Item -ItemType Directory -Path $DistDir | Out-Null
 
-          # Copy required DLLs to build dir
-          Copy-Item (Join-Path $BIN_DIR "zlib1.dll") $BuildDir
-          Copy-Item (Join-Path $BIN_DIR "libxml2-16.dll") $BuildDir
-          Copy-Item (Join-Path $BIN_DIR "libusb-1.0.dll") $BuildDir
-          Copy-Item (Join-Path $BIN_DIR "liblzma-5.dll") $BuildDir
-          Copy-Item (Join-Path $BIN_DIR "libiconv-2.dll") $BuildDir
+          # Copy required DLLs (libusb cannot be virtualized - needs real DLL for USB access)
+          Copy-Item (Join-Path $BIN_DIR "zlib1.dll") $DistDir
+          Copy-Item (Join-Path $BIN_DIR "libxml2-16.dll") $DistDir
+          Copy-Item (Join-Path $BIN_DIR "libusb-1.0.dll") $DistDir
+          Copy-Item (Join-Path $BIN_DIR "liblzma-5.dll") $DistDir
+          Copy-Item (Join-Path $BIN_DIR "libiconv-2.dll") $DistDir
 
           # Copy executables
-          Copy-Item qdl.exe $BuildDir
-          Copy-Item qdl-ramdump.exe $BuildDir
-          Copy-Item ks.exe $BuildDir
+          Copy-Item qdl.exe $DistDir
+          Copy-Item qdl-ramdump.exe $DistDir
+          Copy-Item ks.exe $DistDir
 
-          $distDir = "dist"
-          New-Item -ItemType Directory -Path $distDir | Out-Null
-
-          $absPath = (Get-Location).Path
-          $dlls = @("zlib1.dll", "libxml2-16.dll", "libusb-1.0.dll", "liblzma-5.dll", "libiconv-2.dll")
-
-          foreach ($exe in @("qdl.exe", "qdl-ramdump.exe", "ks.exe")) {
-            $filesXml = ""
-            foreach ($dll in $dlls) {
-              $filesXml += @"
-
-            <File>
-              <Type>3</Type>
-              <Name>%DEFAULT FOLDER%\$dll</Name>
-              <File>$absPath\$BuildDir\$dll</File>
-              <ActiveX>false</ActiveX>
-              <ActiveXInstall>false</ActiveXInstall>
-              <Options>0</Options>
-            </File>
-          "@
-            }
-
-            $project = @"
-          <?xml version="1.0" encoding="utf-8"?>
-          <Project>
-            <InputFile>$absPath\$BuildDir\$exe</InputFile>
-            <OutputFile>$absPath\$distDir\$exe</OutputFile>
-            <CompressFiles>true</CompressFiles>
-            <DeleteExtractedOnExit>true</DeleteExtractedOnExit>
-            <Files>$filesXml
-            </Files>
-          </Project>
-          "@
-            $projectFile = "$exe.evb"
-            [System.IO.File]::WriteAllText($projectFile, $project, [System.Text.Encoding]::UTF8)
-
-            Write-Host "Processing $exe..."
-            & "C:\Program Files (x86)\Enigma Virtual Box\enigmavbconsole.exe" $projectFile
-            if ($LASTEXITCODE -ne 0) {
-              Write-Error "Failed to process $exe"
-              exit 1
-            }
-          }
-
-          # Verify outputs
-          Write-Host "Output files:"
-          Get-ChildItem $distDir
-
-      - name: Package
-        shell: pwsh
-        run: |
+          Get-ChildItem $DistDir
           Compress-Archive -Path dist/* -DestinationPath qdl-windows-x64.zip
 
       - name: Upload artifact
