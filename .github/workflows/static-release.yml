@@ -18,11 +18,12 @@ jobs:
             build-base \
             git \
             libxml2-dev \
-            libxml2-static \
             libusb-dev \
-            libusb-static \
+            zlib-static \
+            xz-dev \
             pkgconf \
-            linux-headers
+            linux-headers \
+            eudev-dev
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,8 +35,10 @@ jobs:
 
       - name: Build static binary
         run: |
-          # Build with static linking
-          make LDFLAGS="-static $(pkg-config --libs --static libxml-2.0 libusb-1.0)"
+          # Build with static linking - need to add all transitive dependencies
+          STATIC_LIBS=$(pkg-config --libs --static libxml-2.0 libusb-1.0)
+          echo "Static libs: $STATIC_LIBS"
+          make LDFLAGS="-static $STATIC_LIBS -ludev -lpthread"
 
       - name: Verify static linking
         run: |
@@ -68,11 +71,12 @@ jobs:
             build-base \
             git \
             libxml2-dev \
-            libxml2-static \
             libusb-dev \
-            libusb-static \
+            zlib-static \
+            xz-dev \
             pkgconf \
-            linux-headers
+            linux-headers \
+            eudev-dev
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -84,7 +88,10 @@ jobs:
 
       - name: Build static binary
         run: |
-          make LDFLAGS="-static $(pkg-config --libs --static libxml-2.0 libusb-1.0)"
+          # Build with static linking - need to add all transitive dependencies
+          STATIC_LIBS=$(pkg-config --libs --static libxml-2.0 libusb-1.0)
+          echo "Static libs: $STATIC_LIBS"
+          make LDFLAGS="-static $STATIC_LIBS -ludev -lpthread"
 
       - name: Verify static linking
         run: |
@@ -106,7 +113,7 @@ jobs:
           name: qdl-linux-arm64-static
           path: qdl-linux-arm64-static.tar.gz
 
-  build-windows-static:
+  build-windows:
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -115,6 +122,7 @@ jobs:
           fetch-depth: 0
 
       - name: Setup MSYS2
+        id: msys2
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
@@ -126,16 +134,13 @@ jobs:
             mingw-w64-x86_64-pkg-config
             mingw-w64-x86_64-libxml2
             mingw-w64-x86_64-libusb
+            mingw-w64-x86_64-xz
 
-      - name: Build static binary
+      - name: Build
         shell: msys2 {0}
         run: |
-          # Get static library flags
-          XML2_STATIC=$(pkg-config --libs --static libxml-2.0)
-          USB_STATIC=$(pkg-config --libs --static libusb-1.0)
-
-          # Build with static linking
-          make LDFLAGS="-static $XML2_STATIC $USB_STATIC -lws2_32"
+          git config --global core.autocrlf true
+          make
 
       - name: Verify build
         shell: msys2 {0}
@@ -150,20 +155,33 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path dist | Out-Null
-          Copy-Item qdl.exe dist/
-          Copy-Item qdl-ramdump.exe dist/
-          Copy-Item ks.exe dist/
-          Compress-Archive -Path dist/* -DestinationPath qdl-windows-x64-static.zip
+          $MSYS2_LOCATION = "${{ steps.msys2.outputs.msys2-location }}"
+          $BIN_DIR = Join-Path $MSYS2_LOCATION "mingw64\bin"
+          $DistDir = "dist"
+          New-Item -ItemType Directory -Path $DistDir | Out-Null
+
+          # Copy required DLLs
+          Copy-Item (Join-Path $BIN_DIR "zlib1.dll") $DistDir
+          Copy-Item (Join-Path $BIN_DIR "libxml2-16.dll") $DistDir
+          Copy-Item (Join-Path $BIN_DIR "libusb-1.0.dll") $DistDir
+          Copy-Item (Join-Path $BIN_DIR "liblzma-5.dll") $DistDir
+          Copy-Item (Join-Path $BIN_DIR "libiconv-2.dll") $DistDir
+
+          # Copy executables
+          Copy-Item qdl.exe $DistDir
+          Copy-Item qdl-ramdump.exe $DistDir
+          Copy-Item ks.exe $DistDir
+
+          Compress-Archive -Path dist/* -DestinationPath qdl-windows-x64.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: qdl-windows-x64-static
-          path: qdl-windows-x64-static.zip
+          name: qdl-windows-x64
+          path: qdl-windows-x64.zip
 
   create-release:
-    needs: [build-linux-static, build-linux-arm64-static, build-windows-static]
+    needs: [build-linux-static, build-linux-arm64-static, build-windows]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
@@ -180,6 +198,6 @@ jobs:
           files: |
             artifacts/qdl-linux-x64-static/qdl-linux-x64-static.tar.gz
             artifacts/qdl-linux-arm64-static/qdl-linux-arm64-static.tar.gz
-            artifacts/qdl-windows-x64-static/qdl-windows-x64-static.zip
+            artifacts/qdl-windows-x64/qdl-windows-x64.zip
           draft: false
           prerelease: false
