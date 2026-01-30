@@ -1,0 +1,185 @@
+name: Static Release Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-linux-static:
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:latest
+    steps:
+      - name: Install dependencies
+        run: |
+          apk add --no-cache \
+            build-base \
+            git \
+            libxml2-dev \
+            libxml2-static \
+            libusb-dev \
+            libusb-static \
+            pkgconf \
+            linux-headers
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fix git safe directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build static binary
+        run: |
+          # Build with static linking
+          make LDFLAGS="-static $(pkg-config --libs --static libxml-2.0 libusb-1.0)"
+
+      - name: Verify static linking
+        run: |
+          file qdl
+          ldd qdl 2>&1 | grep -q "Not a valid dynamic program" || ldd qdl 2>&1 | grep -q "statically linked" && echo "Static binary confirmed"
+
+      - name: Run tests
+        run: make tests
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp qdl qdl-ramdump ks dist/
+          cd dist && tar -czvf ../qdl-linux-x64-static.tar.gz *
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qdl-linux-x64-static
+          path: qdl-linux-x64-static.tar.gz
+
+  build-linux-arm64-static:
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: alpine:latest
+    steps:
+      - name: Install dependencies
+        run: |
+          apk add --no-cache \
+            build-base \
+            git \
+            libxml2-dev \
+            libxml2-static \
+            libusb-dev \
+            libusb-static \
+            pkgconf \
+            linux-headers
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fix git safe directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build static binary
+        run: |
+          make LDFLAGS="-static $(pkg-config --libs --static libxml-2.0 libusb-1.0)"
+
+      - name: Verify static linking
+        run: |
+          file qdl
+          ldd qdl 2>&1 | grep -q "Not a valid dynamic program" || ldd qdl 2>&1 | grep -q "statically linked" && echo "Static binary confirmed"
+
+      - name: Run tests
+        run: make tests
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp qdl qdl-ramdump ks dist/
+          cd dist && tar -czvf ../qdl-linux-arm64-static.tar.gz *
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qdl-linux-arm64-static
+          path: qdl-linux-arm64-static.tar.gz
+
+  build-windows-static:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: >
+            base-devel
+            git
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-make
+            mingw-w64-x86_64-pkg-config
+            mingw-w64-x86_64-libxml2
+            mingw-w64-x86_64-libusb
+
+      - name: Build static binary
+        shell: msys2 {0}
+        run: |
+          # Get static library flags
+          XML2_STATIC=$(pkg-config --libs --static libxml-2.0)
+          USB_STATIC=$(pkg-config --libs --static libusb-1.0)
+
+          # Build with static linking
+          make LDFLAGS="-static $XML2_STATIC $USB_STATIC -lws2_32"
+
+      - name: Verify build
+        shell: msys2 {0}
+        run: |
+          file qdl.exe
+          ./qdl.exe --version || true
+
+      - name: Run tests
+        shell: msys2 {0}
+        run: make tests
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item qdl.exe dist/
+          Copy-Item qdl-ramdump.exe dist/
+          Copy-Item ks.exe dist/
+          Compress-Archive -Path dist/* -DestinationPath qdl-windows-x64-static.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qdl-windows-x64-static
+          path: qdl-windows-x64-static.zip
+
+  create-release:
+    needs: [build-linux-static, build-linux-arm64-static, build-windows-static]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/qdl-linux-x64-static/qdl-linux-x64-static.tar.gz
+            artifacts/qdl-linux-arm64-static/qdl-linux-arm64-static.tar.gz
+            artifacts/qdl-windows-x64-static/qdl-windows-x64-static.zip
+          draft: false
+          prerelease: false
