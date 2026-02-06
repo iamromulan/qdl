@@ -403,9 +403,18 @@ jobs:
             mingw-w64-i686-gcc
             mingw-w64-i686-pkg-config
             mingw-w64-i686-libxml2
-            mingw-w64-i686-libusb
             mingw-w64-i686-xz
             mingw-w64-i686-zlib
+
+      - name: Build libusb from source
+        shell: msys2 {0}
+        run: |
+          # mingw-w64-i686-libusb was dropped from MSYS2, build from source
+          curl -sL https://github.com/libusb/libusb/releases/download/v1.0.27/libusb-1.0.27.tar.bz2 | tar xj
+          cd libusb-1.0.27
+          ./configure --host=i686-w64-mingw32 --enable-static --disable-shared --prefix=/mingw32
+          make -j$(nproc) && make install
+          cd ..
 
       - name: Build static
         shell: msys2 {0}
@@ -501,6 +510,13 @@ jobs:
           make -j$(nproc) && make install
           cd ..
 
+          # Build libiconv
+          curl -sL https://ftp.gnu.org/pub/gnu/libiconv/libiconv-1.17.tar.gz | tar xz
+          cd libiconv-1.17
+          ./configure --host=aarch64-w64-mingw32 --enable-static --disable-shared --prefix="$PREFIX"
+          make -j$(nproc) && make install
+          cd ..
+
           # Build libusb
           curl -sL https://github.com/libusb/libusb/releases/download/v1.0.27/libusb-1.0.27.tar.bz2 | tar xj
           cd libusb-1.0.27
@@ -517,7 +533,7 @@ jobs:
 
           STATIC_DEFINES="-DLIBXML_STATIC -DLZMA_API_STATIC"
           CFLAGS="-O2 -Wall -g $STATIC_DEFINES -I$PREFIX/include/libxml2 -I$PREFIX/include/libusb-1.0 -I$PREFIX/include"
-          LDFLAGS="$PREFIX/lib/libxml2.a $PREFIX/lib/libusb-1.0.a $PREFIX/lib/liblzma.a $PREFIX/lib/libz.a -lws2_32 -lsetupapi -lbcrypt -lole32 -lshlwapi -liconv -static -static-libgcc"
+          LDFLAGS="$PREFIX/lib/libxml2.a $PREFIX/lib/libusb-1.0.a $PREFIX/lib/liblzma.a $PREFIX/lib/libz.a $PREFIX/lib/libiconv.a -lws2_32 -lsetupapi -lbcrypt -lole32 -lshlwapi -static -static-libgcc"
 
           echo "CFLAGS: $CFLAGS"
           echo "LDFLAGS: $LDFLAGS"
