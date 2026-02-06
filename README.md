@@ -5,6 +5,13 @@
 An enhanced fork of [linux-msm/qdl](https://github.com/linux-msm/qdl) with improved
 compatibility for Quectel firmware and maybe other Qualcomm firmware.
 
+## Download/Install/Run
+
+Static binaries are avalible for download under [Releases](https://github.com/iamromulan/qfenix/releases)
+
+These are all static/standalone binaries with the exeption of the macOS binaries. The macOS ones are semi-static, 
+3rd party libs are bundled but still needs dynamic system frameworks that should exist on every Mac.
+
 ## What's New in QFenix
 
 This fork adds several features while maintaining full backwards compatibility with
@@ -41,54 +48,6 @@ qfenix prog_firehose_ddr.elf rawprogram*.xml patch*.xml
 | `-M, --skip-md5` | Skip MD5 verification of firmware files |
 
 ---
-
-## Build
-
-### Linux
-
-```bash
-sudo apt install libxml2-dev libusb-1.0-0-dev help2man
-make
-```
-
-### MacOS
-
-For Homebrew users,
-
-```bash
-brew install libxml2 pkg-config libusb help2man
-make
-```
-
-For MacPorts users
-
-```bash
-sudo port install libxml2 pkgconfig libusb help2man
-make
-```
-
-### Windows
-
-First, install the [MSYS2 environment](https://www.msys2.org/). Then, run the
-MSYS2 MinGW64 terminal (located at `<msys2-installation-path>\mingw64.exe`) and
-install additional packages needed for compilation using the `pacman` tool:
-
-```bash
-pacman -S base-devel --needed
-pacman -S git
-pacman -S help2man
-pacman -S mingw-w64-x86_64-gcc
-pacman -S mingw-w64-x86_64-make
-pacman -S mingw-w64-x86_64-pkg-config
-pacman -S mingw-w64-x86_64-libusb
-pacman -S mingw-w64-x86_64-libxml2
-```
-
-Then use the `make` tool to build:
-
-```bash
-make
-```
 
 ## Usage
 
@@ -202,6 +161,54 @@ qfenix programmer.cpio rawprogram.xml
 
 ```bash
 make tests
+```
+
+## Build/Compile yourself
+
+### Linux
+
+```bash
+sudo apt install libxml2-dev libusb-1.0-0-dev help2man
+make
+```
+
+### MacOS
+
+For Homebrew users,
+
+```bash
+brew install libxml2 pkg-config libusb help2man
+make
+```
+
+For MacPorts users
+
+```bash
+sudo port install libxml2 pkgconfig libusb help2man
+make
+```
+
+### Windows
+
+First, install the [MSYS2 environment](https://www.msys2.org/). Then, run the
+MSYS2 MinGW64 terminal (located at `<msys2-installation-path>\mingw64.exe`) and
+install additional packages needed for compilation using the `pacman` tool:
+
+```bash
+pacman -S base-devel --needed
+pacman -S git
+pacman -S help2man
+pacman -S mingw-w64-x86_64-gcc
+pacman -S mingw-w64-x86_64-make
+pacman -S mingw-w64-x86_64-pkg-config
+pacman -S mingw-w64-x86_64-libusb
+pacman -S mingw-w64-x86_64-libxml2
+```
+
+Then use the `make` tool to build:
+
+```bash
+make
 ```
 
 ## Upstream
