@@ -3,6 +3,7 @@
 #define __READ_H__
 
 #include <stdbool.h>
+#include <libxml/tree.h>
 
 #include "list.h"
 
@@ -19,6 +20,7 @@ struct read_op {
 	struct list_head node;
 };
 
+int read_op_load_tag(xmlNode *node, const char *incdir);
 int read_op_load(const char *read_op_file, const char *incdir);
 int read_op_execute(struct qdl_device *qdl,
 		    int (*apply)(struct qdl_device *qdl, struct read_op *read_op, int fd));

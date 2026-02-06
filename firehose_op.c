@@ -2,12 +2,13 @@
 /*
  * Unified firehose operation queue for document-order execution.
  *
- * All erase, program, and read operations are registered here in the
- * order they appear in the XML files, and executed in that same order
- * by firehose_op_execute().
+ * All erase, program, read, and patch operations are registered here
+ * in the order they appear in the XML files, and executed in that same
+ * order by firehose_op_execute().
  */
 #include <fcntl.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include "qdl.h"
@@ -33,14 +34,33 @@ void firehose_op_add_read(struct read_op *read_op)
 	list_add(&firehose_ops, &op->node);
 }
 
+void firehose_op_add_patch(struct patch *patch)
+{
+	struct firehose_op *op = calloc(1, sizeof(*op));
+
+	op->type = OP_PATCH;
+	op->patch = patch;
+	list_add(&firehose_ops, &op->node);
+}
+
 int firehose_op_execute(struct qdl_device *qdl,
 			int (*apply_erase)(struct qdl_device *, struct program *),
 			int (*apply_program)(struct qdl_device *, struct program *, int),
-			int (*apply_read)(struct qdl_device *, struct read_op *, int))
+			int (*apply_read)(struct qdl_device *, struct read_op *, int),
+			int (*apply_patch)(struct qdl_device *, struct patch *))
 {
+	unsigned int patch_count = 0;
+	unsigned int patch_idx = 0;
 	struct firehose_op *op;
 	int ret;
 	int fd;
+
+	/* Pre-count patches for progress reporting */
+	list_for_each_entry(op, &firehose_ops, node) {
+		if (op->type == OP_PATCH && op->patch->filename &&
+		    !strcmp(op->patch->filename, "DISK"))
+			patch_count++;
+	}
 
 	list_for_each_entry(op, &firehose_ops, node) {
 		switch (op->type) {
@@ -74,8 +94,21 @@ int firehose_op_execute(struct qdl_device *qdl,
 			if (ret)
 				return ret;
 			break;
+		case OP_PATCH:
+			if (!op->patch->filename)
+				continue;
+			if (strcmp(op->patch->filename, "DISK"))
+				continue;
+			ret = apply_patch(qdl, op->patch);
+			if (ret)
+				return ret;
+			ux_progress("Applying patches", patch_idx++, patch_count);
+			break;
 		}
 	}
+
+	if (patch_count)
+		ux_info("%d patches applied\n", patch_idx);
 
 	return 0;
 }

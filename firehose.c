@@ -1032,11 +1032,8 @@ int firehose_run(struct qdl_device *qdl)
 	if (ret)
 		return ret;
 
-	ret = firehose_op_execute(qdl, firehose_erase, firehose_program, firehose_read_op);
-	if (ret)
-		return ret;
-
-	ret = patch_execute(qdl, firehose_apply_patch);
+	ret = firehose_op_execute(qdl, firehose_erase, firehose_program,
+				  firehose_read_op, firehose_apply_patch);
 	if (ret)
 		return ret;
 

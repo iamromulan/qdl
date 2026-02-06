@@ -132,6 +132,7 @@ enum firehose_op_type {
 	OP_ERASE,
 	OP_PROGRAM,
 	OP_READ,
+	OP_PATCH,
 };
 
 struct firehose_op {
@@ -139,16 +140,19 @@ struct firehose_op {
 	union {
 		struct program *program;
 		struct read_op *read_op;
+		struct patch *patch;
 	};
 	struct list_head node;
 };
 
 void firehose_op_add_program(struct program *program);
 void firehose_op_add_read(struct read_op *read_op);
+void firehose_op_add_patch(struct patch *patch);
 int firehose_op_execute(struct qdl_device *qdl,
 			int (*apply_erase)(struct qdl_device *, struct program *),
 			int (*apply_program)(struct qdl_device *, struct program *, int),
-			int (*apply_read)(struct qdl_device *, struct read_op *, int));
+			int (*apply_read)(struct qdl_device *, struct read_op *, int),
+			int (*apply_patch)(struct qdl_device *, struct patch *));
 void free_firehose_ops(void);
 
 #endif

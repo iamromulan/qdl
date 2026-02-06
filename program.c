@@ -299,8 +299,12 @@ int program_load(const char *program_file, bool is_nand, bool allow_missing, con
 			errors = load_erase_tag(node, is_nand);
 		else if (!xmlStrcmp(node->name, (xmlChar *)"program"))
 			errors = load_program_tag(node, is_nand, allow_missing, incdir);
+		else if (!xmlStrcmp(node->name, (xmlChar *)"read"))
+			errors = read_op_load_tag(node, incdir);
+		else if (!xmlStrcmp(node->name, (xmlChar *)"patch"))
+			errors = patch_load_tag(node);
 		else {
-			ux_err("unrecognized tag \"%s\" in program-type file \"%s\"\n", node->name, program_file);
+			ux_err("unrecognized tag \"%s\" in \"%s\"\n", node->name, program_file);
 			errors = -EINVAL;
 		}
 

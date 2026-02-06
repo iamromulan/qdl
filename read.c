@@ -19,14 +19,42 @@
 
 static struct list_head read_ops = LIST_INIT(read_ops);
 
-int read_op_load(const char *read_op_file, const char *incdir)
+int read_op_load_tag(xmlNode *node, const char *incdir)
 {
 	struct read_op *read_op;
+	char tmp[PATH_MAX];
+	int errors = 0;
+
+	read_op = calloc(1, sizeof(struct read_op));
+
+	read_op->sector_size = attr_as_unsigned(node, "SECTOR_SIZE_IN_BYTES", &errors);
+	read_op->filename = attr_as_string(node, "filename", &errors);
+	read_op->partition = attr_as_unsigned(node, "physical_partition_number", &errors);
+	read_op->num_sectors = attr_as_unsigned(node, "num_partition_sectors", &errors);
+	read_op->start_sector = attr_as_string(node, "start_sector", &errors);
+
+	if (errors) {
+		free(read_op);
+		return -EINVAL;
+	}
+
+	if (incdir) {
+		snprintf(tmp, PATH_MAX, "%s/%s", incdir, read_op->filename);
+		if (access(tmp, F_OK) != -1)
+			read_op->filename = strdup(tmp);
+	}
+
+	list_add(&read_ops, &read_op->node);
+	firehose_op_add_read(read_op);
+
+	return 0;
+}
+
+int read_op_load(const char *read_op_file, const char *incdir)
+{
 	xmlNode *node;
 	xmlNode *root;
 	xmlDoc *doc;
-	int errors;
-	char tmp[PATH_MAX];
 
 	doc = xmlReadFile(read_op_file, NULL, 0);
 	if (!doc) {
@@ -39,36 +67,11 @@ int read_op_load(const char *read_op_file, const char *incdir)
 		if (node->type != XML_ELEMENT_NODE)
 			continue;
 
-		if (xmlStrcmp(node->name, (xmlChar *)"read")) {
-			ux_err("unrecognized tag \"%s\" in read-type file \"%s\", ignoring\n",
-			       node->name, read_op_file);
+		if (xmlStrcmp(node->name, (xmlChar *)"read"))
 			continue;
-		}
 
-		errors = 0;
-
-		read_op = calloc(1, sizeof(struct read_op));
-
-		read_op->sector_size = attr_as_unsigned(node, "SECTOR_SIZE_IN_BYTES", &errors);
-		read_op->filename = attr_as_string(node, "filename", &errors);
-		read_op->partition = attr_as_unsigned(node, "physical_partition_number", &errors);
-		read_op->num_sectors = attr_as_unsigned(node, "num_partition_sectors", &errors);
-		read_op->start_sector = attr_as_string(node, "start_sector", &errors);
-
-		if (errors) {
-			ux_err("errors while parsing read-type file \"%s\"\n", read_op_file);
-			free(read_op);
-			continue;
-		}
-
-		if (incdir) {
-			snprintf(tmp, PATH_MAX, "%s/%s", incdir, read_op->filename);
-			if (access(tmp, F_OK) != -1)
-				read_op->filename = strdup(tmp);
-		}
-
-		list_add(&read_ops, &read_op->node);
-		firehose_op_add_read(read_op);
+		if (read_op_load_tag(node, incdir) < 0)
+			ux_err("errors while parsing read tag in \"%s\"\n", read_op_file);
 	}
 
 	xmlFreeDoc(doc);
