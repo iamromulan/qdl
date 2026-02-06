@@ -1,6 +1,6 @@
 QDL := qfenix
 RAMDUMP := qfenix-ramdump
-VERSION := $(or $(VERSION), $(shell git describe --dirty --always --tags 2>/dev/null), "1.0.0-beta.1")
+VERSION := $(or $(VERSION), $(shell git describe --dirty --always --tags 2>/dev/null), "unknown-version")
 
 PKG_CONFIG ?= pkg-config
 CFLAGS += -O2 -Wall -g `$(PKG_CONFIG) --cflags libxml-2.0 libusb-1.0`
