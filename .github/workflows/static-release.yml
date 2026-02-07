@@ -525,6 +525,8 @@ jobs:
           chmod +x /tmp/pkg-config-nolibs
 
           make CC=aarch64-w64-mingw32-gcc \
+               OS=Windows_NT \
+               WINDRES=aarch64-w64-mingw32-windres \
                PKG_CONFIG=/tmp/pkg-config-nolibs \
                CFLAGS="$CFLAGS" \
                LDFLAGS="$LDFLAGS"

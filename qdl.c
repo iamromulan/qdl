@@ -24,6 +24,7 @@
 #include "patch.h"
 #include "program.h"
 #include "ufs.h"
+#include "diag_switch.h"
 #include "oscompat.h"
 #include "vip.h"
 #include "version.h"
@@ -680,6 +681,7 @@ static void print_usage(FILE *out)
 	fprintf(out, "       %s list\n", __progname);
 	fprintf(out, "       %s ramdump [--debug] [-o <ramdump-path>] [<segment-filter>,...]\n", __progname);
 	fprintf(out, "       %s ks -p <device-node> -s <id:file> [-s <id:file>]...\n", __progname);
+	fprintf(out, "       %s diag2edl [--debug] [--serial=<serial>]\n", __progname);
 	fprintf(out, "\nOptions:\n");
 	fprintf(out, " -d, --debug\t\t\tPrint detailed debug info\n");
 	fprintf(out, " -v, --version\t\t\tPrint the current version and exit\n");
@@ -933,6 +935,70 @@ static int qdl_ks(int argc, char **argv)
 
 	close(qdl.fd);
 
+	return 0;
+}
+
+static void print_diag2edl_usage(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s diag2edl [options]\n", __progname);
+	fprintf(out, "\nSwitch a device from DIAG mode to EDL mode.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, " -d, --debug\t\tPrint detailed debug info\n");
+	fprintf(out, " -v, --version\t\tPrint the current version and exit\n");
+	fprintf(out, " -S, --serial=T\t\tSelect target by serial number T\n");
+	fprintf(out, " -h, --help\t\tPrint this usage info\n");
+}
+
+static int qdl_diag2edl(int argc, char **argv)
+{
+	char *serial = NULL;
+	int opt;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:h", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 'h':
+			print_diag2edl_usage(stdout);
+			return 0;
+		default:
+			print_diag2edl_usage(stderr);
+			return 1;
+		}
+	}
+
+	if (qdl_debug)
+		print_version();
+
+	if (!diag_is_device_in_diag_mode(serial)) {
+		fprintf(stderr, "No device found in DIAG mode\n");
+		return 1;
+	}
+
+	printf("Device in DIAG mode, switching to EDL...\n");
+	if (diag_switch_to_edl(serial) < 0) {
+		fprintf(stderr, "Failed to switch device to EDL mode\n");
+		return 1;
+	}
+
+	printf("EDL switch command sent successfully\n");
 	return 0;
 }
 
@@ -1242,6 +1308,8 @@ int main(int argc, char **argv)
 		return qdl_ramdump(argc - 1, argv + 1);
 	if (argc >= 2 && !strcmp(argv[1], "ks"))
 		return qdl_ks(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "diag2edl"))
+		return qdl_diag2edl(argc - 1, argv + 1);
 
 	return qdl_flash(argc, argv);
 }

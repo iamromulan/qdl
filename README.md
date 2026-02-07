@@ -103,6 +103,14 @@ qfenix list
 qfenix ramdump [-o /path/to/output] [segment-filter]
 ```
 
+### Switch from DIAG to EDL mode
+
+Switch a device from DIAG mode to EDL mode without flashing:
+
+```bash
+qfenix diag2edl
+```
+
 ### Keystore / Sahara over serial device
 
 ```bash
