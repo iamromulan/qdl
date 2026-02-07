@@ -7,10 +7,11 @@ compatibility for Quectel firmware and maybe other Qualcomm firmware.
 
 ## Download/Install/Run
 
-Static binaries are avalible for download under [Releases](https://github.com/iamromulan/qfenix/releases)
+Static binaries are available for download under [Releases](https://github.com/iamromulan/qfenix/releases).
+A single `qfenix` binary provides all functionality via subcommands.
 
-These are all static/standalone binaries with the exeption of the macOS binaries. The macOS ones are semi-static, 
-3rd party libs are bundled but still needs dynamic system frameworks that should exist on every Mac.
+These are all static/standalone binaries with the exception of the macOS binaries. The macOS ones are semi-static,
+3rd party libs are bundled but still need dynamic system frameworks that should exist on every Mac.
 
 ## What's New in QFenix
 
@@ -30,6 +31,8 @@ the original QDL:
   checksums are present in the XML (can be skipped with `--skip-md5`)
 - **Improved NAND Support** - Fixes for NAND device flashing (last_sector handling)
 - **Relaxed XML Parsing** - Optional attributes (label, sparse) no longer cause failures
+- **Single Binary** - All tools (`ramdump`, `ks`) are consolidated into one `qfenix`
+  binary with subcommands
 
 ### Quick Start with Firmware Directory
 
@@ -86,6 +89,24 @@ If you have multiple boards connected, provide the serial number:
 
 ```bash
 qfenix --serial=0AA94EFD -F /path/to/firmware/
+```
+
+### List connected devices
+
+```bash
+qfenix list
+```
+
+### RAM dump extraction
+
+```bash
+qfenix ramdump [-o /path/to/output] [segment-filter]
+```
+
+### Keystore / Sahara over serial device
+
+```bash
+qfenix ks -p /dev/mhi0_QAIC_SAHARA -s 1:/opt/qti-aic/firmware/fw1.bin -s 2:/opt/qti-aic/firmware/fw2.bin
 ```
 
 ### Reading and writing raw binaries

@@ -1,5 +1,4 @@
 QDL := qfenix
-RAMDUMP := qfenix-ramdump
 VERSION := $(or $(VERSION), $(shell git describe --dirty --always --tags 2>/dev/null), "unknown-version")
 
 PKG_CONFIG ?= pkg-config
@@ -13,13 +12,6 @@ prefix := /usr/local
 QDL_SRCS := firehose.c firehose_op.c io.c qdl.c sahara.c util.c patch.c program.c read.c sha2.c sim.c ufs.c usb.c ux.c oscompat.c vip.c sparse.c gpt.c diag_switch.c md5.c
 QDL_OBJS := $(QDL_SRCS:.c=.o)
 
-RAMDUMP_SRCS := ramdump.c sahara.c io.c sim.c usb.c util.c ux.c oscompat.c diag_switch.c
-RAMDUMP_OBJS := $(RAMDUMP_SRCS:.c=.o)
-
-KS_OUT := qfenix-ks
-KS_SRCS := ks.c sahara.c util.c ux.c oscompat.c
-KS_OBJS := $(KS_SRCS:.c=.o)
-
 CHECKPATCH_SOURCES := $(shell find . -type f \( -name "*.c" -o -name "*.h" -o -name "*.sh" \) ! -name "sha2.c" ! -name "sha2.h" ! -name "md5.c" ! -name "md5.h" ! -name "*version.h" ! -name "list.h")
 CHECKPATCH_ROOT := https://raw.githubusercontent.com/torvalds/linux/v6.15/scripts
 CHECKPATCH_URL := $(CHECKPATCH_ROOT)/checkpatch.pl
@@ -27,26 +19,16 @@ CHECKPATCH_SP_URL := $(CHECKPATCH_ROOT)/spelling.txt
 CHECKPATCH := ./.scripts/checkpatch.pl
 CHECKPATCH_SP := ./.scripts/spelling.txt
 
-MANPAGES := qfenix-ks.1 qfenix-ramdump.1 qfenix.1
-
-default: $(QDL) $(RAMDUMP) $(KS_OUT)
+default: $(QDL)
 
 $(QDL): $(QDL_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-$(RAMDUMP): $(RAMDUMP_OBJS)
-	$(CC) -o $@ $^ $(LDFLAGS)
-
-$(KS_OUT): $(KS_OBJS)
-	$(CC) -o $@ $^ $(LDFLAGS)
-
-compile_commands.json: $(QDL_SRCS) $(KS_SRCS)
+compile_commands.json: $(QDL_SRCS)
 	@echo -n $^ | jq -snR "[inputs|split(\" \")[]|{directory:\"$(PWD)\", command: \"$(CC) $(CFLAGS) -c \(.)\", file:.}]" > $@
 
-manpages: $(KS_OUT) $(RAMDUMP) $(QDL)
-	help2man -N -n "QFenix KS" -o qfenix-ks.1 ./qfenix-ks
+manpages: $(QDL)
 	help2man -N -n "QFenix - Qualcomm Firehose" -o qfenix.1 ./qfenix
-	help2man -N -n "QFenix Ramdump" -o qfenix-ramdump.1 ./qfenix-ramdump
 
 version.h::
 	@echo "#define VERSION \"$(VERSION)\"" > .version.h
@@ -57,16 +39,14 @@ qdl.o: version.h
 
 clean:
 	rm -f $(QDL) $(QDL_OBJS)
-	rm -f $(RAMDUMP) $(RAMDUMP_OBJS)
-	rm -f $(KS_OUT) $(KS_OBJS)
-	rm -f $(MANPAGES)
+	rm -f qfenix.1
 	rm -f compile_commands.json
 	rm -f version.h .version.h
 	rm -f $(CHECKPATCH)
 	rm -f $(CHECKPATCH_SP)
 	if [ -d .scripts ]; then rmdir .scripts; fi
 
-install: $(QDL) $(RAMDUMP) $(KS_OUT)
+install: $(QDL)
 	install -d $(DESTDIR)$(prefix)/bin
 	install -m 755 $^ $(DESTDIR)$(prefix)/bin
 

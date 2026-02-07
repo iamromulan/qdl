@@ -45,10 +45,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linux-x64
-          path: |
-            qfenix
-            qfenix-ramdump
-            qfenix-ks
+          path: qfenix
 
   # Linux ARM64 - TRUE STATIC using QEMU emulation in Alpine ARM64 container
   build-linux-arm64:
@@ -89,10 +86,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linux-arm64
-          path: |
-            qfenix
-            qfenix-ramdump
-            qfenix-ks
+          path: qfenix
 
   # Linux ARM32 - TRUE STATIC using QEMU emulation in Alpine ARM container
   build-linux-arm:
@@ -133,10 +127,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linux-arm
-          path: |
-            qfenix
-            qfenix-ramdump
-            qfenix-ks
+          path: qfenix
 
   # macOS ARM64 - Static third-party libs, dynamic system frameworks
   build-macos-arm64:
@@ -222,10 +213,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: macos-arm64
-          path: |
-            qfenix
-            qfenix-ramdump
-            qfenix-ks
+          path: qfenix
 
   # macOS x64 - Static third-party libs, dynamic system frameworks
   build-macos-x64:
@@ -311,10 +299,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: macos-x64
-          path: |
-            qfenix
-            qfenix-ramdump
-            qfenix-ks
+          path: qfenix
 
   # Windows x64 - True static build
   build-windows-x64:
@@ -381,10 +366,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-x64
-          path: |
-            qfenix.exe
-            qfenix-ramdump.exe
-            qfenix-ks.exe
+          path: qfenix.exe
   # Windows x86 (32-bit) - True static build
   build-windows-x86:
     runs-on: windows-latest
@@ -459,10 +441,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-x86
-          path: |
-            qfenix.exe
-            qfenix-ramdump.exe
-            qfenix-ks.exe
+          path: qfenix.exe
 
   # Windows ARM64 - Cross-compiled with llvm-mingw
   build-windows-arm64:
@@ -557,10 +536,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-arm64
-          path: |
-            qfenix.exe
-            qfenix-ramdump.exe
-            qfenix-ks.exe
+          path: qfenix.exe
 
   create-release:
     needs: [build-linux-x64, build-linux-arm64, build-linux-arm, build-macos-arm64, build-macos-x64, build-windows-x64, build-windows-x86, build-windows-arm64]
@@ -578,20 +554,20 @@ jobs:
         run: |
           cd artifacts
 
+          # Linux/macOS: tar.gz to preserve executable permission
           for dir in linux-x64 linux-arm64 linux-arm macos-arm64 macos-x64; do
             cd $dir
-            chmod +x qfenix qfenix-ramdump qfenix-ks 2>/dev/null || true
-            tar -czvf ../qfenix-${dir}.tar.gz *
+            chmod +x qfenix
+            tar -czvf ../qfenix-${dir}.tar.gz qfenix
             cd ..
           done
 
+          # Windows: rename with platform suffix, no archive needed
           for dir in windows-x64 windows-x86 windows-arm64; do
-            cd $dir
-            zip -r ../qfenix-${dir}.zip *
-            cd ..
+            cp ${dir}/qfenix.exe qfenix-${dir}.exe
           done
 
-          ls -la *.tar.gz *.zip
+          ls -la *.tar.gz *.exe
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
@@ -602,8 +578,8 @@ jobs:
             artifacts/qfenix-linux-arm.tar.gz
             artifacts/qfenix-macos-arm64.tar.gz
             artifacts/qfenix-macos-x64.tar.gz
-            artifacts/qfenix-windows-x64.zip
-            artifacts/qfenix-windows-x86.zip
-            artifacts/qfenix-windows-arm64.zip
+            artifacts/qfenix-windows-x64.exe
+            artifacts/qfenix-windows-x86.exe
+            artifacts/qfenix-windows-arm64.exe
           draft: false
           prerelease: true

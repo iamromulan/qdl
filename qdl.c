@@ -8,6 +8,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <libgen.h>
 #include <stdbool.h>
@@ -678,6 +679,7 @@ static void print_usage(FILE *out)
 	fprintf(out, "       %s [options] <prog.mbn> ((read | write) <address> <binary>)...\n", __progname);
 	fprintf(out, "       %s list\n", __progname);
 	fprintf(out, "       %s ramdump [--debug] [-o <ramdump-path>] [<segment-filter>,...]\n", __progname);
+	fprintf(out, "       %s ks -p <device-node> -s <id:file> [-s <id:file>]...\n", __progname);
 	fprintf(out, "\nOptions:\n");
 	fprintf(out, " -d, --debug\t\t\tPrint detailed debug info\n");
 	fprintf(out, " -v, --version\t\t\tPrint the current version and exit\n");
@@ -805,6 +807,133 @@ out_cleanup:
 	qdl_deinit(qdl);
 
 	return ret;
+}
+
+static int ks_read(struct qdl_device *qdl, void *buf, size_t len,
+		   unsigned int timeout __unused)
+{
+	return read(qdl->fd, buf, len);
+}
+
+static int ks_write(struct qdl_device *qdl, const void *buf, size_t len,
+		    unsigned int timeout __unused)
+{
+	return write(qdl->fd, buf, len);
+}
+
+static void print_ks_usage(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out,
+		"%s ks -p <sahara dev_node> -s <id:file path> ...\n",
+		__progname);
+	fprintf(out,
+		" -h                   --help                      Print this usage info\n"
+		" -p                   --port                      Sahara device node to use\n"
+		" -s <id:file path>    --sahara <id:file path>     Sahara protocol file mapping\n"
+		"\n"
+		"One -p instance is required.  One or more -s instances are required.\n"
+		"\n"
+		"Example:\n"
+		"%s ks -p /dev/mhi0_QAIC_SAHARA -s 1:/opt/qti-aic/firmware/fw1.bin"
+		" -s 2:/opt/qti-aic/firmware/fw2.bin\n",
+		__progname);
+}
+
+static int qdl_ks(int argc, char **argv)
+{
+	struct sahara_image mappings[MAPPING_SZ] = {};
+	struct qdl_device qdl = {};
+	const char *filename;
+	bool found_mapping = false;
+	char *dev_node = NULL;
+	long file_id;
+	char *colon;
+	int opt;
+	int ret;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"help", no_argument, 0, 'h'},
+		{"version", no_argument, 0, 'v'},
+		{"port", required_argument, 0, 'p'},
+		{"sahara", required_argument, 0, 's'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvp:s:h", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'p':
+			dev_node = optarg;
+			printf("Using port - %s\n", dev_node);
+			break;
+		case 's':
+			found_mapping = true;
+			file_id = strtol(optarg, NULL, 10);
+			if (file_id < 0) {
+				print_ks_usage(stderr);
+				return 1;
+			}
+			if (file_id >= MAPPING_SZ) {
+				fprintf(stderr,
+					"ID:%ld exceeds the max value of %d\n",
+					file_id,
+					MAPPING_SZ - 1);
+				return 1;
+			}
+			colon = strchr(optarg, ':');
+			if (!colon) {
+				print_ks_usage(stderr);
+				return 1;
+			}
+			filename = &optarg[colon - optarg + 1];
+			ret = load_sahara_image(filename, &mappings[file_id]);
+			if (ret < 0)
+				return 1;
+
+			printf("Created mapping ID:%ld File:%s\n",
+			       file_id, filename);
+			break;
+		case 'h':
+			print_ks_usage(stdout);
+			return 0;
+		default:
+			print_ks_usage(stderr);
+			return 1;
+		}
+	}
+
+	if (!dev_node || !found_mapping) {
+		print_ks_usage(stderr);
+		return 1;
+	}
+
+	if (qdl_debug)
+		print_version();
+
+	qdl.fd = open(dev_node, O_RDWR);
+	if (qdl.fd < 0) {
+		fprintf(stderr, "Unable to open %s\n", dev_node);
+		return 1;
+	}
+
+	qdl.read = ks_read;
+	qdl.write = ks_write;
+
+	ret = sahara_run(&qdl, mappings, NULL, NULL);
+	if (ret < 0)
+		return 1;
+
+	close(qdl.fd);
+
+	return 0;
 }
 
 static int qdl_flash(int argc, char **argv)
@@ -1111,6 +1240,8 @@ int main(int argc, char **argv)
 		return qdl_list(stdout);
 	if (argc >= 2 && !strcmp(argv[1], "ramdump"))
 		return qdl_ramdump(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "ks"))
+		return qdl_ks(argc - 1, argv + 1);
 
 	return qdl_flash(argc, argv);
 }
