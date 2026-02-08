@@ -383,13 +383,26 @@ static void sahara_debug64(struct qdl_device *qdl, struct sahara_pkt *pkt,
 	if (n < 0)
 		return;
 
+	if (read_req.debug64_req.length == 0 ||
+	    read_req.debug64_req.length > 16 * 1024 * 1024) {
+		ux_err("debug64 table size out of range: 0x%" PRIx64 "\n",
+		       read_req.debug64_req.length);
+		return;
+	}
+
 	table = malloc(read_req.debug64_req.length);
+	if (!table) {
+		ux_err("failed to allocate debug64 table\n");
+		return;
+	}
 
 	n = qdl_read(qdl, table, pkt->debug64_req.length, SAHARA_CMD_TIMEOUT_MS);
-	if (n < 0)
+	if (n < 0 || (size_t)n < sizeof(table[0])) {
+		free(table);
 		return;
+	}
 
-	for (i = 0; i < pkt->debug64_req.length / sizeof(table[0]); i++) {
+	for (i = 0; i < (size_t)n / sizeof(table[0]); i++) {
 		if (sahara_debug64_filter(table[i].filename, filter)) {
 			ux_info("%s skipped per filter\n", table[i].filename);
 			continue;
@@ -503,6 +516,11 @@ int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 		}
 
 		pkt = (struct sahara_pkt *)buf;
+		if (pkt->length < 8 || pkt->length > sizeof(buf)) {
+			ux_err("invalid sahara packet length %u\n",
+			       pkt->length);
+			break;
+		}
 		if (buf_len < pkt->length) {
 			ux_err("incomplete sahara packet (%zu of %u bytes)\n",
 			       buf_len, pkt->length);

@@ -43,6 +43,13 @@ static int poll_wait_diag(int fd, short events, int timeout_ms)
 static int diag_detect_port(char *port_buf, size_t buf_size,
 			    const char *serial)
 {
+#ifdef __APPLE__
+	(void)port_buf;
+	(void)buf_size;
+	(void)serial;
+	ux_err("DIAG port detection is not supported on macOS\n");
+	return 0;
+#else
 	const char *base = "/sys/bus/usb/devices";
 	DIR *busdir, *infdir;
 	struct dirent *de, *de2;
@@ -144,6 +151,7 @@ static int diag_detect_port(char *port_buf, size_t buf_size,
 
 	closedir(busdir);
 	return found;
+#endif /* __APPLE__ */
 }
 
 static int diag_port_open(const char *port)

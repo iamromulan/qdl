@@ -22,6 +22,7 @@
 #include "pcie.h"
 
 #ifdef __linux__
+#include <poll.h>
 #include <sys/ioctl.h>
 
 /* DIAG command to switch Qualcomm devices to EDL mode */
@@ -268,11 +269,18 @@ static int pcie_read(struct qdl_device *qdl, void *buf, size_t len,
 		     unsigned int timeout)
 {
 	struct qdl_device_pcie *pcie;
+	struct pollfd pfd;
 	int ret;
 
-	(void)timeout;
-
 	pcie = container_of(qdl, struct qdl_device_pcie, base);
+
+	pfd.fd = pcie->edl_fd;
+	pfd.events = POLLIN;
+	ret = poll(&pfd, 1, timeout ? (int)timeout : 30000);
+	if (ret < 0)
+		return -errno;
+	if (ret == 0)
+		return -ETIMEDOUT;
 
 	ret = read(pcie->edl_fd, buf, len);
 	if (ret < 0)

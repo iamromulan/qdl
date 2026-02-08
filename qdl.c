@@ -541,6 +541,11 @@ static int find_files_recursive_impl(const char *dir, const char *prefix,
 	return 0;
 }
 
+static int cmp_strings(const void *a, const void *b)
+{
+	return strcmp(*(const char **)a, *(const char **)b);
+}
+
 static int find_files_recursive(const char *dir, const char *prefix, const char *suffix,
 				char ***files_out, int *count_out)
 {
@@ -548,8 +553,13 @@ static int find_files_recursive(const char *dir, const char *prefix, const char 
 
 	*files_out = NULL;
 	*count_out = 0;
-	return find_files_recursive_impl(dir, prefix, suffix,
-					 files_out, count_out, &capacity, 0);
+	find_files_recursive_impl(dir, prefix, suffix,
+				  files_out, count_out, &capacity, 0);
+
+	if (*count_out > 1)
+		qsort(*files_out, *count_out, sizeof(char *), cmp_strings);
+
+	return 0;
 }
 
 static enum qdl_storage_type detect_storage_from_filename(const char *filename)
@@ -1284,6 +1294,15 @@ static int qdl_ramdump(int argc, char **argv)
 		print_version();
 
 	ret = qdl_open(qdl, serial);
+#ifdef _WIN32
+	if (ret == -2) {
+		qdl_deinit(qdl);
+		qdl = qdl_init(QDL_DEVICE_PCIE);
+		if (!qdl)
+			return 1;
+		ret = qdl_open(qdl, serial);
+	}
+#endif
 	if (ret) {
 		ret = 1;
 		goto out_cleanup;
@@ -2639,6 +2658,17 @@ static int qdl_flash(int argc, char **argv)
 		if (ret < 0)
 			exit(1);
 
+		/* Load all rawread files first (backup before flash) */
+		for (i = 0; i < fw.rawread_count; i++) {
+			char *xml_dir_buf = strdup(fw.rawread[i]);
+			char *xml_dir = dirname(xml_dir_buf);
+
+			ret = read_op_load(fw.rawread[i], xml_dir);
+			free(xml_dir_buf);
+			if (ret < 0)
+				errx(1, "read_op_load %s failed", fw.rawread[i]);
+		}
+
 		/* Load all rawprogram files, using each XML's directory as incdir */
 		for (i = 0; i < fw.rawprogram_count; i++) {
 			char *xml_dir_buf = strdup(fw.rawprogram[i]);
@@ -2651,22 +2681,11 @@ static int qdl_flash(int argc, char **argv)
 				errx(1, "program_load %s failed", fw.rawprogram[i]);
 		}
 
-		/* Load all patch files */
+		/* Load all patch files last */
 		for (i = 0; i < fw.patch_count; i++) {
 			ret = patch_load(fw.patch[i]);
 			if (ret < 0)
 				errx(1, "patch_load %s failed", fw.patch[i]);
-		}
-
-		/* Load all rawread files */
-		for (i = 0; i < fw.rawread_count; i++) {
-			char *xml_dir_buf = strdup(fw.rawread[i]);
-			char *xml_dir = dirname(xml_dir_buf);
-
-			ret = read_op_load(fw.rawread[i], xml_dir);
-			free(xml_dir_buf);
-			if (ret < 0)
-				errx(1, "read_op_load %s failed", fw.rawread[i]);
 		}
 
 		if (!allow_fusing && program_is_sec_partition_flashed())
@@ -2821,7 +2840,7 @@ out_cleanup:
 
 int main(int argc, char **argv)
 {
-	if (argc == 2 && !strcmp(argv[1], "list"))
+	if (argc >= 2 && !strcmp(argv[1], "list"))
 		return qdl_list(stdout);
 	if (argc >= 2 && !strcmp(argv[1], "ramdump"))
 		return qdl_ramdump(argc - 1, argv + 1);

@@ -304,6 +304,13 @@ static int poll_wait(int fd, short events, int timeout_ms)
 static int detect_diag_port_linux(char *port_buf, size_t buf_size,
 				  const char *serial)
 {
+#ifdef __APPLE__
+	(void)port_buf;
+	(void)buf_size;
+	(void)serial;
+	warnx("DIAG port detection is not supported on macOS");
+	return 0;
+#else
 	const char *base = "/sys/bus/usb/devices";
 	DIR *busdir, *infdir;
 	struct dirent *de, *de2;
@@ -423,6 +430,7 @@ static int detect_diag_port_linux(char *port_buf, size_t buf_size,
 
 	closedir(busdir);
 	return found;
+#endif /* __APPLE__ */
 }
 
 static int open_and_send_edl_cmd_linux(const char *port)
