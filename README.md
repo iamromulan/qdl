@@ -2,8 +2,9 @@
 
 [![License](https://img.shields.io/badge/License-BSD_3--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
 
-An enhanced fork of [linux-msm/qdl](https://github.com/linux-msm/qdl) with improved
-compatibility for Quectel firmware and maybe other Qualcomm firmware.
+An enhanced fork of [linux-msm/qdl](https://github.com/linux-msm/qdl) — a Swiss Army knife
+for Qualcomm-based modems and devices. Flash firmware, read/write NV items, browse EFS,
+inspect GPT partitions, and more — all from a single binary.
 
 ## Download/Install/Run
 
@@ -27,18 +28,32 @@ the original QDL:
   workflows like backup-then-erase-then-flash within a single XML.
 - **DIAG to EDL Auto-Switching** - Automatically switches devices from DIAG mode to
   EDL mode (can be disabled with `--no-auto-edl`). Works on both Linux and Windows.
+- **PCIe/MHI Transport** (`-P` / `--pcie`) - Flash PCIe-connected modems (T99W175,
+  T99W373, T99W640, etc.) via MHI BHI on Linux or COM ports on Windows.
+- **DIAG Protocol** - NV item read/write, EFS directory listing, file download, and
+  factory image dump — all over the DIAG serial port.
+- **Comprehensive Device Listing** - `qfenix list` shows USB EDL devices, DIAG serial
+  ports, and PCIe MHI devices across all transports.
+- **GPT Inspection & A/B Slots** - Print partition tables, query/set the active A/B
+  slot, and dump all partitions without XML files.
+- **Wide Modem Support** - Centralized VID/PID database covering Quectel, Sierra
+  Wireless, Telit, Fibocom, Simcom, MeiG, Foxconn/Dell, and more.
+- **Multi-Device Targeting** - Use `--serial` with COM port names on Windows
+  (e.g. `--serial COM49`) to target a specific modem when multiple are connected.
 - **MD5 Verification** - Verifies firmware file integrity before flashing when MD5
   checksums are present in the XML (can be skipped with `--skip-md5`)
 - **Improved NAND Support** - Fixes for NAND device flashing (last_sector handling)
 - **Relaxed XML Parsing** - Optional attributes (label, sparse) no longer cause failures
-- **Single Binary** - All tools (`ramdump`, `ks`) are consolidated into one `qfenix`
-  binary with subcommands
+- **Single Binary** - All tools consolidated into one `qfenix` binary with subcommands
 
-### Quick Start with Firmware Directory
+### Quick Start
 
 ```bash
 # Auto-detect everything from a firmware directory
 qfenix -F /path/to/firmware/
+
+# Flash a PCIe modem
+qfenix --pcie -F /path/to/firmware/
 
 # Dry run to see what would be flashed
 qfenix --dry-run -F /path/to/firmware/
@@ -47,17 +62,40 @@ qfenix --dry-run -F /path/to/firmware/
 qfenix prog_firehose_ddr.elf rawprogram*.xml patch*.xml
 ```
 
-### New Command Line Options
+---
+
+## Usage
+
+### Subcommands
+
+| Subcommand | Description |
+|------------|-------------|
+| *(default)* | Flash firmware (Firehose protocol) |
+| `list` | List connected EDL, DIAG, and PCIe devices |
+| `diag2edl` | Switch a device from DIAG mode to EDL mode |
+| `printgpt` | Print GPT partition tables from a live device |
+| `storageinfo` | Query storage hardware information |
+| `reset` | Reset/power-off/EDL-reboot a device |
+| `getslot` | Show the active A/B slot |
+| `setslot` | Set the active A/B slot |
+| `readall` | Dump all partitions to files |
+| `nvread` | Read an NV item via DIAG |
+| `nvwrite` | Write an NV item via DIAG |
+| `efsls` | List an EFS directory via DIAG |
+| `efsget` | Download a file from EFS via DIAG |
+| `efsdump` | Dump the EFS factory image via DIAG |
+| `ramdump` | Extract RAM dumps via Sahara |
+| `ks` | Keystore/Sahara over serial device nodes |
+
+### Flash Options
 
 | Option | Description |
 |--------|-------------|
 | `-F, --firmware-dir=PATH` | Recursively auto-detect and load firmware from directory |
 | `-E, --no-auto-edl` | Disable automatic DIAG to EDL mode switching |
 | `-M, --skip-md5` | Skip MD5 verification of firmware files |
-
----
-
-## Usage
+| `-P, --pcie` | Use PCIe/MHI transport instead of USB |
+| `-S, --serial=T` | Target device by serial number or COM port name |
 
 ### EDL mode
 
@@ -89,18 +127,94 @@ If you have multiple boards connected, provide the serial number:
 
 ```bash
 qfenix --serial=0AA94EFD -F /path/to/firmware/
+
+# On Windows, target a specific COM port
+qfenix --serial=COM49 -F /path/to/firmware/
 ```
 
 ### List connected devices
+
+Shows USB EDL devices, DIAG serial ports, and PCIe MHI devices:
 
 ```bash
 qfenix list
 ```
 
-### RAM dump extraction
+Example output:
+```
+EDL devices (USB):
+  05c6:9008  SN:0AA94EFD
+
+DIAG devices:
+  /dev/ttyUSB0  2c7c:0800  iface 0  USB
+
+PCIe MHI devices:
+  /dev/mhi_BHI          port 0
+  /dev/mhi_DIAG         port 0
+```
+
+### DIAG operations
+
+Read and write NV items on a device in DIAG mode:
 
 ```bash
-qfenix ramdump [-o /path/to/output] [segment-filter]
+# Read NV item 0 (ESN)
+qfenix nvread 0
+
+# Read NV item with subscription index
+qfenix nvread 6828 --index=0
+
+# Write NV item (hex data)
+qfenix nvwrite 6828 0102030405
+
+# Target a specific device
+qfenix nvread 0 --serial COM49
+```
+
+Browse and download files from the modem's EFS filesystem:
+
+```bash
+# List EFS root directory
+qfenix efsls /
+
+# Download a file from EFS
+qfenix efsget /nv/item_files/modem/mmode/band_pref.bin ./band_pref.bin
+
+# Dump factory EFS image
+qfenix efsdump efs_backup.bin
+```
+
+### GPT and partition operations
+
+Inspect partition tables and A/B slot status on a live device in EDL mode:
+
+```bash
+# Print GPT partition tables
+qfenix printgpt prog_firehose_ddr.elf
+
+# Get active A/B slot
+qfenix getslot prog_firehose_ddr.elf
+
+# Set active slot
+qfenix setslot a prog_firehose_ddr.elf
+
+# Query storage info
+qfenix storageinfo prog_firehose_ddr.elf
+
+# Dump all partitions to a directory
+qfenix readall prog_firehose_ddr.elf -o /path/to/output/
+```
+
+### PCIe modem flashing
+
+Flash PCIe-connected modems (Dell DW5930e/DW5931e/DW5934e, Foxconn T99W175/T99W373/T99W640, etc.):
+
+```bash
+# Linux: uses MHI BHI for programmer upload
+qfenix --pcie -F /path/to/firmware/
+
+# Windows: uses COM port (auto-detected or specified)
+qfenix --pcie --serial=COM51 -F /path/to/firmware/
 ```
 
 ### Switch from DIAG to EDL mode
@@ -109,6 +223,28 @@ Switch a device from DIAG mode to EDL mode without flashing:
 
 ```bash
 qfenix diag2edl
+
+# Target a specific device
+qfenix diag2edl --serial COM49
+```
+
+### Reset device
+
+```bash
+# Reset (reboot)
+qfenix reset prog_firehose_ddr.elf
+
+# Power off
+qfenix reset prog_firehose_ddr.elf --mode=off
+
+# Reboot into EDL
+qfenix reset prog_firehose_ddr.elf --mode=edl
+```
+
+### RAM dump extraction
+
+```bash
+qfenix ramdump [-o /path/to/output] [segment-filter]
 ```
 
 ### Keystore / Sahara over serial device
@@ -244,6 +380,22 @@ Then use the `make` tool to build:
 ```bash
 make
 ```
+
+## Supported Devices
+
+QFenix includes a comprehensive VID/PID database for automatic detection of:
+
+- **Qualcomm** reference designs (SDX55, SDX65, SDX72)
+- **Quectel** (EM05, EM06, EM12, EM060K, EM120K, RM520N, RM255C, RG650V, etc.)
+- **Sierra Wireless** (EM74xx, EM9190, EM9191, EM9291)
+- **Telit** (LM960, FN980, FN990, FM990, LE910C4)
+- **Fibocom** (FM150, FM160)
+- **Foxconn/Dell** (DW5820e, DW5930e, DW5931e, DW5934e / T99W175, T99W373, T99W640)
+- **Simcom** (SIM8200EA, SIM8380G)
+- **MeiG Smart** (SRM825, SRM930)
+- **Sony, ZTE, LG, Netgear, Huawei** EDL/DIAG devices
+
+PCIe modems (MHI-based) are detected via friendly name matching on Windows.
 
 ## Upstream
 

@@ -1,0 +1,122 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+#ifndef __DIAG_H__
+#define __DIAG_H__
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+/* DIAG command codes */
+#define DIAG_NV_READ_F		0x26
+#define DIAG_NV_WRITE_F		0x27
+#define DIAG_SUBSYS_CMD_F	0x4B
+
+/* NV subsystem ID for indexed reads/writes */
+#define DIAG_SUBSYS_NV		0x30
+#define DIAG_SUBSYS_NV_READ	0x01
+#define DIAG_SUBSYS_NV_WRITE	0x02
+
+/* EFS subsystem IDs */
+#define DIAG_SUBSYS_EFS_STD	0x13
+#define DIAG_SUBSYS_EFS_ALT	0x3E
+
+/* EFS command codes */
+#define EFS2_DIAG_HELLO		0
+#define EFS2_DIAG_OPEN		2
+#define EFS2_DIAG_CLOSE		3
+#define EFS2_DIAG_READ		4
+#define EFS2_DIAG_OPENDIR	11
+#define EFS2_DIAG_READDIR	12
+#define EFS2_DIAG_CLOSEDIR	13
+#define EFS2_DIAG_STAT		15
+#define EFS2_DIAG_FSTAT		17
+
+/* EFS factory image commands */
+#define EFS2_DIAG_PREP_FACT_IMAGE	25
+#define EFS2_DIAG_FACT_IMAGE_START	22
+#define EFS2_DIAG_FACT_IMAGE_READ	23
+#define EFS2_DIAG_FACT_IMAGE_END	24
+
+/* NV item sizes */
+#define NV_ITEM_DATA_SIZE	128
+#define NV_ITEM_PKT_SIZE	(1 + 2 + NV_ITEM_DATA_SIZE + 2)
+
+/* EFS read chunk size */
+#define EFS_MAX_READ_REQ	1024
+
+/* NV item status codes */
+#define NV_DONE_S	0
+#define NV_BUSY_S	1
+#define NV_BADCMD_S	2
+#define NV_FULL_S	3
+#define NV_FAIL_S	4
+#define NV_NOTACTIVE_S	5
+#define NV_BADPARM_S	6
+#define NV_READONLY_S	7
+#define NV_NOTDEF_S	8
+
+struct diag_session {
+#ifdef _WIN32
+	intptr_t fd;	/* Windows HANDLE for serial port */
+#else
+	int fd;
+#endif
+	uint8_t efs_method;
+	bool efs_detected;
+};
+
+struct nv_item {
+	uint16_t item;
+	uint8_t data[NV_ITEM_DATA_SIZE];
+	uint16_t status;
+};
+
+struct efs_dirent {
+	int32_t entry_type;
+	int32_t mode;
+	int32_t size;
+	int32_t atime;
+	int32_t mtime;
+	int32_t ctime;
+	char name[256];
+};
+
+struct efs_stat {
+	int32_t mode;
+	int32_t size;
+	int32_t nlink;
+	int32_t atime;
+	int32_t mtime;
+	int32_t ctime;
+};
+
+/* Session management */
+struct diag_session *diag_open(const char *serial);
+void diag_close(struct diag_session *sess);
+
+/* Low-level send/receive */
+int diag_send(struct diag_session *sess, const uint8_t *cmd, size_t cmd_len,
+	      uint8_t *resp, size_t resp_size);
+
+/* NV item operations */
+int diag_nv_read(struct diag_session *sess, uint16_t item,
+		 struct nv_item *out);
+int diag_nv_write(struct diag_session *sess, uint16_t item,
+		  const uint8_t *data, size_t data_len);
+int diag_nv_read_sub(struct diag_session *sess, uint16_t item,
+		     uint16_t index, struct nv_item *out);
+int diag_nv_write_sub(struct diag_session *sess, uint16_t item,
+		      uint16_t index, const uint8_t *data, size_t data_len);
+const char *diag_nv_status_str(uint16_t status);
+
+/* EFS operations */
+int diag_efs_detect(struct diag_session *sess);
+int diag_efs_listdir(struct diag_session *sess, const char *path,
+		     void (*callback)(const struct efs_dirent *entry,
+				      void *ctx),
+		     void *ctx);
+int diag_efs_readfile(struct diag_session *sess, const char *src_path,
+		      const char *dst_path);
+int diag_efs_dump(struct diag_session *sess, const char *output_file);
+
+#endif

@@ -2,6 +2,8 @@
 /*
  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
+#include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #define _FILE_OFFSET_BITS 64
@@ -59,6 +61,7 @@ struct gpt_partition {
 	unsigned int partition;
 	unsigned int start_sector;
 	unsigned int num_sectors;
+	uint64_t attrs;
 
 	struct gpt_partition *next;
 };
@@ -203,6 +206,7 @@ static int gpt_load_table_from_partition(struct qdl_device *qdl, unsigned int ph
 		partition->start_sector = entry->first_lba;
 		/* if first_lba == last_lba there is 1 sector worth of data (IE: add 1 below) */
 		partition->num_sectors = entry->last_lba - entry->first_lba + 1;
+		partition->attrs = entry->attrs;
 
 		ux_debug("  %3d: %s start sector %u, num sectors %u\n", i, partition->name,
 			 partition->start_sector, partition->num_sectors);
@@ -279,4 +283,250 @@ int gpt_find_by_name(struct qdl_device *qdl, const char *name, int *phys_partiti
 	}
 
 	return 0;
+}
+
+static void guid_to_string(const struct gpt_guid *guid, char *out, size_t len)
+{
+	snprintf(out, len,
+		 "%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+		 guid->data1, guid->data2, guid->data3,
+		 guid->data4[0], guid->data4[1],
+		 guid->data4[2], guid->data4[3],
+		 guid->data4[4], guid->data4[5],
+		 guid->data4[6], guid->data4[7]);
+}
+
+static void print_size_human(uint64_t bytes, char *out, size_t len)
+{
+	if (bytes >= (uint64_t)1024 * 1024 * 1024)
+		snprintf(out, len, "%.1f GiB",
+			 (double)bytes / (1024.0 * 1024.0 * 1024.0));
+	else if (bytes >= 1024 * 1024)
+		snprintf(out, len, "%.1f MiB",
+			 (double)bytes / (1024.0 * 1024.0));
+	else if (bytes >= 1024)
+		snprintf(out, len, "%.1f KiB", (double)bytes / 1024.0);
+	else
+		snprintf(out, len, "%llu B", (unsigned long long)bytes);
+}
+
+static int gpt_print_table_from_partition(struct qdl_device *qdl,
+					  unsigned int phys_partition,
+					  bool *eof)
+{
+	struct gpt_entry *entry;
+	struct gpt_header gpt;
+	uint8_t buf[4096];
+	struct read_op op;
+	unsigned int offset;
+	unsigned int lba;
+	char lba_buf[10];
+	uint16_t name_utf16le[36];
+	char name[36 * 4];
+	char type_str[40];
+	char unique_str[40];
+	char size_str[32];
+	char disk_guid_str[40];
+	int ret;
+	unsigned int i;
+	int count = 0;
+
+	memset(&op, 0, sizeof(op));
+
+	op.sector_size = qdl->sector_size;
+	op.start_sector = "1";
+	op.num_sectors = 1;
+	op.partition = phys_partition;
+
+	memset(&buf, 0, sizeof(buf));
+	ret = firehose_read_buf(qdl, &op, &gpt, sizeof(gpt));
+	if (ret) {
+		*eof = true;
+		return -1;
+	}
+
+	if (memcmp(gpt.signature, "EFI PART", 8)) {
+		ux_err("partition %d has no GPT header\n", phys_partition);
+		return 0;
+	}
+
+	if (gpt.part_entry_size > qdl->sector_size ||
+	    gpt.num_part_entries > 1024) {
+		ux_debug("partition %d has invalid GPT header\n",
+			 phys_partition);
+		return -1;
+	}
+
+	guid_to_string(&gpt.disk_guid, disk_guid_str,
+		       sizeof(disk_guid_str));
+
+	printf("\n=== Physical Partition %d ===\n", phys_partition);
+	printf("Disk GUID:        %s\n", disk_guid_str);
+	printf("First usable LBA: %llu\n",
+	       (unsigned long long)gpt.first_usable_lba);
+	printf("Last usable LBA:  %llu\n",
+	       (unsigned long long)gpt.last_usable_lba);
+	printf("Partition entries: %u (size: %u bytes each)\n",
+	       gpt.num_part_entries, gpt.part_entry_size);
+	printf("\n");
+	printf("%-4s %-32s %12s %12s %10s  %-36s  Attrs\n",
+	       "#", "Name", "Start LBA", "End LBA", "Size", "Type GUID");
+	printf("%-4s %-32s %12s %12s %10s  %-36s  -----\n",
+	       "---", "--------------------------------",
+	       "------------", "------------", "----------",
+	       "------------------------------------");
+
+	for (i = 0; i < gpt.num_part_entries; i++) {
+		offset = (i * gpt.part_entry_size) % qdl->sector_size;
+
+		if (offset == 0) {
+			lba = gpt.part_entry_lba +
+			      i * gpt.part_entry_size / qdl->sector_size;
+			sprintf(lba_buf, "%u", lba);
+			op.start_sector = lba_buf;
+
+			memset(buf, 0, sizeof(buf));
+			ret = firehose_read_buf(qdl, &op, buf, sizeof(buf));
+			if (ret) {
+				ux_err("failed to read GPT entries from %d:%u\n",
+				       phys_partition, lba);
+				return -1;
+			}
+		}
+
+		entry = (struct gpt_entry *)(buf + offset);
+
+		if (!memcmp(&entry->type_guid, &gpt_zero_guid,
+			    sizeof(struct gpt_guid)))
+			continue;
+
+		memcpy(name_utf16le, entry->name_utf16le,
+		       sizeof(name_utf16le));
+		utf16le_to_utf8(name_utf16le, 36, (uint8_t *)name,
+				sizeof(name));
+
+		guid_to_string(&entry->type_guid, type_str,
+			       sizeof(type_str));
+		guid_to_string(&entry->unique_guid, unique_str,
+			       sizeof(unique_str));
+		print_size_human((entry->last_lba - entry->first_lba + 1) *
+				 qdl->sector_size,
+				 size_str, sizeof(size_str));
+
+		printf("%-4u %-32s %12llu %12llu %10s  %s  0x%016llx\n",
+		       count, name,
+		       (unsigned long long)entry->first_lba,
+		       (unsigned long long)entry->last_lba,
+		       size_str, type_str,
+		       (unsigned long long)entry->attrs);
+		count++;
+	}
+
+	return 0;
+}
+
+int gpt_print_table(struct qdl_device *qdl)
+{
+	unsigned int i;
+	bool eof = false;
+	int ret = 0;
+
+	for (i = 0; ; i++) {
+		ret = gpt_print_table_from_partition(qdl, i, &eof);
+		if (ret)
+			break;
+	}
+
+	return eof ? 0 : ret;
+}
+
+#define AB_FLAG_OFFSET 6
+#define AB_PARTITION_ATTR_SLOT_ACTIVE (1 << 2)
+
+int gpt_get_active_slot(struct qdl_device *qdl)
+{
+	struct gpt_partition *part;
+	uint8_t flags_byte;
+	int ret;
+
+	ret = gpt_load_tables(qdl);
+	if (ret < 0)
+		return -1;
+
+	for (part = gpt_partitions; part; part = part->next) {
+		if (strcmp(part->name, "boot_a") == 0) {
+			flags_byte = (part->attrs >> (AB_FLAG_OFFSET * 8)) &
+				     0xFF;
+			if (flags_byte & AB_PARTITION_ATTR_SLOT_ACTIVE)
+				return 'a';
+		}
+	}
+
+	for (part = gpt_partitions; part; part = part->next) {
+		if (strcmp(part->name, "boot_b") == 0) {
+			flags_byte = (part->attrs >> (AB_FLAG_OFFSET * 8)) &
+				     0xFF;
+			if (flags_byte & AB_PARTITION_ATTR_SLOT_ACTIVE)
+				return 'b';
+		}
+	}
+
+	ux_err("no active A/B slot found (no boot_a or boot_b partitions)\n");
+	return -1;
+}
+
+int gpt_set_active_slot(struct qdl_device *qdl, char slot)
+{
+	(void)qdl;
+	(void)slot;
+	ux_err("setslot is not yet implemented\n");
+	return -1;
+}
+
+int gpt_read_all_partitions(struct qdl_device *qdl, const char *outdir)
+{
+	struct gpt_partition *part;
+	char filepath[4096];
+	int ret;
+	int count = 0;
+	int failed = 0;
+
+	ret = gpt_load_tables(qdl);
+	if (ret < 0)
+		return -1;
+
+	/* Create output directory if needed */
+#ifdef _WIN32
+	ret = mkdir(outdir);
+#else
+	ret = mkdir(outdir, 0755);
+#endif
+	if (ret < 0 && errno != EEXIST) {
+		ux_err("failed to create output directory %s: %s\n",
+		       outdir, strerror(errno));
+		return -1;
+	}
+
+	for (part = gpt_partitions; part; part = part->next) {
+		snprintf(filepath, sizeof(filepath), "%s/lun%u_%s.bin",
+			 outdir, part->partition, part->name);
+
+		ux_info("reading partition '%s' (%u sectors) to %s\n",
+			part->name, part->num_sectors, filepath);
+
+		ret = firehose_read_to_file(qdl, part->partition,
+					    part->start_sector,
+					    part->num_sectors,
+					    qdl->sector_size, filepath);
+		if (ret < 0) {
+			ux_err("failed to read partition '%s'\n", part->name);
+			failed++;
+		} else {
+			count++;
+		}
+	}
+
+	ux_info("read %d partitions (%d failed) to %s\n",
+		count, failed, outdir);
+	return failed ? -1 : 0;
 }

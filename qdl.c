@@ -24,7 +24,9 @@
 #include "patch.h"
 #include "program.h"
 #include "ufs.h"
+#include "diag.h"
 #include "diag_switch.h"
+#include "gpt.h"
 #include "oscompat.h"
 #include "vip.h"
 #include "version.h"
@@ -366,7 +368,7 @@ err_free_doc:
  *
  * Returns: 0 on success, -1 otherwise.
  */
-static int decode_programmer(char *s, struct sahara_image *images)
+int decode_programmer(char *s, struct sahara_image *images)
 {
 	struct sahara_image archive;
 	char *filename;
@@ -698,6 +700,7 @@ static void print_usage(FILE *out)
 	fprintf(out, " -E, --no-auto-edl\t\tDisable automatic DIAG to EDL mode switching\n");
 	fprintf(out, " -M, --skip-md5\t\t\tSkip MD5 verification of firmware files\n");
 	fprintf(out, " -F, --firmware-dir=T\t\tAuto-detect and load firmware from directory T\n");
+	fprintf(out, " -P, --pcie\t\t\tUse PCIe/MHI transport instead of USB\n");
 	fprintf(out, " -h, --help\t\t\tPrint this usage info\n");
 	fprintf(out, "\nArguments:\n");
 	fprintf(out, " <program-xml>\t\txml file containing <program> or <erase> directives\n");
@@ -711,27 +714,465 @@ static void print_usage(FILE *out)
 	fprintf(out, "\nExample: %s prog_firehose_ddr.elf rawprogram*.xml patch*.xml\n", __progname);
 }
 
-static int qdl_list(FILE *out)
+/*
+ * List USB EDL devices via libusb.
+ * Returns number of devices found.
+ */
+static int list_usb_edl(FILE *out)
 {
 	struct qdl_device_desc *devices;
 	unsigned int count;
 	unsigned int i;
+	int printed_header = 0;
 
 	devices = usb_list(&count);
-	if (!devices)
-		return 1;
-
-	if (count == 0) {
-		fprintf(out, "No devices found\n");
-	} else {
-		for (i = 0; i < count; i++)
-			fprintf(out, "%04x:%04x\t%s\n",
-				devices[i].vid, devices[i].pid, devices[i].serial);
+	if (!devices || count == 0) {
+		free(devices);
+		return 0;
 	}
+
+	fprintf(out, "EDL devices (USB):\n");
+	printed_header = 1;
+
+	for (i = 0; i < count; i++)
+		fprintf(out, "  %04x:%04x  SN:%s\n",
+			devices[i].vid, devices[i].pid, devices[i].serial);
 
 	free(devices);
 
+	return printed_header ? (int)count : 0;
+}
+
+#ifdef _WIN32
+#include <windows.h>
+#include <setupapi.h>
+
+static const GUID GUID_DEVCLASS_PORTS_LIST = {
+	0x4d36e978, 0xe325, 0x11ce,
+	{0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18}
+};
+
+static int is_qc_modem_name_list(const char *name)
+{
+	if (strstr(name, "Qualcomm") || strstr(name, "Snapdragon") ||
+	    strstr(name, "QDLoader") || strstr(name, "Sahara") ||
+	    strstr(name, "QCOM") || strstr(name, "SDX") ||
+	    strstr(name, "DW59") || strstr(name, "DW58") ||
+	    strstr(name, "Quectel") || strstr(name, "Sierra") ||
+	    strstr(name, "Fibocom") || strstr(name, "Telit") ||
+	    strstr(name, "Foxconn") || strstr(name, "T99W") ||
+	    strstr(name, "EM91") || strstr(name, "EM92") ||
+	    strstr(name, "FM150") || strstr(name, "FM160") ||
+	    strstr(name, "SIM82") || strstr(name, "SIM83") ||
+	    strstr(name, "RM5") || strstr(name, "RM2"))
+		return 1;
 	return 0;
+}
+
+static int is_diag_name_list(const char *name)
+{
+	if (strstr(name, "DIAG") || strstr(name, "DM Port") ||
+	    strstr(name, "QDLoader") || strstr(name, "Diagnostic") ||
+	    strstr(name, "Sahara"))
+		return 1;
+	return 0;
+}
+
+static int is_edl_name_list(const char *name)
+{
+	if (strstr(name, "EDL"))
+		return 1;
+	return 0;
+}
+
+static int is_skip_name_list(const char *name)
+{
+	if (strstr(name, "AT Port") || strstr(name, "AT Interface") ||
+	    strstr(name, "NMEA") || strstr(name, "GPS") ||
+	    strstr(name, "Modem") || strstr(name, "Audio"))
+		return 1;
+	return 0;
+}
+
+/*
+ * Scan all Windows COM ports and list Qualcomm EDL and DIAG devices.
+ * Returns total number of devices found.
+ */
+static int list_com_ports(FILE *out)
+{
+	HDEVINFO hDevInfo;
+	SP_DEVINFO_DATA devInfoData;
+	DWORD i;
+	int edl_count = 0, diag_count = 0;
+	int edl_header = 0, diag_header = 0;
+
+	/* Collect ports in two passes: first EDL, then DIAG */
+	hDevInfo = SetupDiGetClassDevsA(&GUID_DEVCLASS_PORTS_LIST, NULL, NULL,
+					DIGCF_PRESENT);
+	if (hDevInfo == INVALID_HANDLE_VALUE)
+		return 0;
+
+	devInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
+
+	/* Pass 1: EDL ports */
+	for (i = 0; SetupDiEnumDeviceInfo(hDevInfo, i, &devInfoData); i++) {
+		char hwid[512] = {0};
+		char friendlyName[256] = {0};
+		char portName[32] = {0};
+		char *vidStr, *pidStr;
+		HKEY hKey;
+		DWORD size;
+		int vid = 0, pid = 0;
+		int is_edl = 0;
+		const char *bus;
+
+		SetupDiGetDeviceRegistryPropertyA(hDevInfo, &devInfoData,
+			SPDRP_HARDWAREID, NULL, (PBYTE)hwid,
+			sizeof(hwid), NULL);
+
+		SetupDiGetDeviceRegistryPropertyA(hDevInfo, &devInfoData,
+			SPDRP_FRIENDLYNAME, NULL, (PBYTE)friendlyName,
+			sizeof(friendlyName), NULL);
+
+		vidStr = strstr(hwid, "VID_");
+		pidStr = strstr(hwid, "PID_");
+
+		if (vidStr)
+			vid = strtol(vidStr + 4, NULL, 16);
+		if (pidStr)
+			pid = strtol(pidStr + 4, NULL, 16);
+
+		if (vidStr) {
+			/* USB device */
+			if (is_edl_device(vid, pid)) {
+				is_edl = 1;
+				bus = "USB";
+			}
+		} else {
+			/* PCIe/MHI device — check friendly name */
+			if (is_edl_name_list(friendlyName) &&
+			    is_qc_modem_name_list(friendlyName)) {
+				is_edl = 1;
+				bus = "PCIe";
+			}
+		}
+
+		if (!is_edl)
+			continue;
+
+		hKey = SetupDiOpenDevRegKey(hDevInfo, &devInfoData,
+					    DICS_FLAG_GLOBAL, 0, DIREG_DEV,
+					    KEY_READ);
+		if (hKey == INVALID_HANDLE_VALUE)
+			continue;
+
+		size = sizeof(portName);
+		if (RegQueryValueExA(hKey, "PortName", NULL, NULL,
+				     (LPBYTE)portName, &size) != ERROR_SUCCESS ||
+		    strncmp(portName, "COM", 3) != 0) {
+			RegCloseKey(hKey);
+			continue;
+		}
+		RegCloseKey(hKey);
+
+		if (!edl_header) {
+			fprintf(out, "EDL devices (COM):\n");
+			edl_header = 1;
+		}
+
+		if (vid)
+			fprintf(out, "  %-8s  %04x:%04x  %s  %s\n",
+				portName, vid, pid, friendlyName, bus);
+		else
+			fprintf(out, "  %-8s  %s  %s\n",
+				portName, friendlyName, bus);
+		edl_count++;
+	}
+
+	/* Pass 2: DIAG ports */
+	for (i = 0; SetupDiEnumDeviceInfo(hDevInfo, i, &devInfoData); i++) {
+		char hwid[512] = {0};
+		char friendlyName[256] = {0};
+		char portName[32] = {0};
+		char *vidStr, *pidStr;
+		HKEY hKey;
+		DWORD size;
+		int vid = 0, pid = 0;
+		int is_diag = 0;
+		const char *bus;
+
+		SetupDiGetDeviceRegistryPropertyA(hDevInfo, &devInfoData,
+			SPDRP_HARDWAREID, NULL, (PBYTE)hwid,
+			sizeof(hwid), NULL);
+
+		SetupDiGetDeviceRegistryPropertyA(hDevInfo, &devInfoData,
+			SPDRP_FRIENDLYNAME, NULL, (PBYTE)friendlyName,
+			sizeof(friendlyName), NULL);
+
+		vidStr = strstr(hwid, "VID_");
+		pidStr = strstr(hwid, "PID_");
+
+		if (vidStr)
+			vid = strtol(vidStr + 4, NULL, 16);
+		if (pidStr)
+			pid = strtol(pidStr + 4, NULL, 16);
+
+		if (vidStr) {
+			/* USB device — check DIAG vendor, skip EDL */
+			if (!is_diag_vendor(vid))
+				continue;
+			if (is_edl_device(vid, pid))
+				continue;
+			bus = "USB";
+		} else {
+			/* PCIe/MHI device — check friendly name */
+			if (!is_qc_modem_name_list(friendlyName))
+				continue;
+			/* Skip EDL ports (already listed above) */
+			if (is_edl_name_list(friendlyName))
+				continue;
+			bus = "PCIe";
+		}
+
+		/* Skip non-DIAG ports (AT, NMEA, GPS, etc.) */
+		if (is_skip_name_list(friendlyName))
+			continue;
+
+		hKey = SetupDiOpenDevRegKey(hDevInfo, &devInfoData,
+					    DICS_FLAG_GLOBAL, 0, DIREG_DEV,
+					    KEY_READ);
+		if (hKey == INVALID_HANDLE_VALUE)
+			continue;
+
+		size = sizeof(portName);
+		if (RegQueryValueExA(hKey, "PortName", NULL, NULL,
+				     (LPBYTE)portName, &size) != ERROR_SUCCESS ||
+		    strncmp(portName, "COM", 3) != 0) {
+			RegCloseKey(hKey);
+			continue;
+		}
+		RegCloseKey(hKey);
+
+		if (!diag_header) {
+			if (edl_count > 0)
+				fprintf(out, "\n");
+			fprintf(out, "DIAG devices (COM):\n");
+			diag_header = 1;
+		}
+
+		if (vid) {
+			int iface = get_diag_interface_num(vid, pid);
+
+			fprintf(out, "  %-8s  %04x:%04x  iface %d  %s  %s\n",
+				portName, vid, pid, iface, friendlyName, bus);
+		} else {
+			is_diag = is_diag_name_list(friendlyName);
+			fprintf(out, "  %-8s  %s%s  %s\n",
+				portName, friendlyName,
+				is_diag ? "" : "  (unknown role)",
+				bus);
+		}
+		diag_count++;
+	}
+
+	SetupDiDestroyDeviceInfoList(hDevInfo);
+
+	return edl_count + diag_count;
+}
+
+#else /* Linux/POSIX */
+
+static int list_diag_ports(FILE *out)
+{
+	const char *base = "/sys/bus/usb/devices";
+	DIR *busdir, *infdir;
+	struct dirent *de, *de2;
+	char path[512], line[256];
+	FILE *fp;
+	int count = 0;
+	int printed_header = 0;
+
+	busdir = opendir(base);
+	if (!busdir)
+		return 0;
+
+	while ((de = readdir(busdir)) != NULL) {
+		int major = 0, vid = 0, pid = 0;
+		char devtype[64] = {0};
+		char product[64] = {0};
+		int diag_iface;
+
+		if (!isdigit(de->d_name[0]))
+			continue;
+
+		snprintf(path, sizeof(path), "%s/%s/uevent",
+			 base, de->d_name);
+		fp = fopen(path, "r");
+		if (!fp)
+			continue;
+
+		while (fgets(line, sizeof(line), fp)) {
+			line[strcspn(line, "\r\n")] = 0;
+			if (strncmp(line, "MAJOR=", 6) == 0)
+				major = atoi(line + 6);
+			else if (strncmp(line, "DEVTYPE=", 8) == 0)
+				snprintf(devtype, sizeof(devtype),
+					 "%.63s", line + 8);
+			else if (strncmp(line, "PRODUCT=", 8) == 0)
+				snprintf(product, sizeof(product),
+					 "%.63s", line + 8);
+		}
+		fclose(fp);
+
+		if (major != 189 || strncmp(devtype, "usb_device", 10) != 0)
+			continue;
+
+		sscanf(product, "%x/%x", &vid, &pid);
+
+		if (!is_diag_vendor(vid))
+			continue;
+
+		/* Skip EDL-mode devices (already shown by usb_list) */
+		if (is_edl_device(vid, pid))
+			continue;
+
+		diag_iface = get_diag_interface_num(vid, pid);
+
+		/* Look for tty port under the DIAG interface */
+		snprintf(path, sizeof(path), "%s/%s:1.%d",
+			 base, de->d_name, diag_iface);
+		infdir = opendir(path);
+		if (!infdir) {
+			/* Try interface 0 as fallback */
+			snprintf(path, sizeof(path), "%s/%s:1.0",
+				 base, de->d_name);
+			infdir = opendir(path);
+		}
+		if (!infdir)
+			continue;
+
+		while ((de2 = readdir(infdir)) != NULL) {
+			char ttypath[520];
+			DIR *ttydir;
+			struct dirent *de3;
+
+			if (strncmp(de2->d_name, "ttyUSB", 6) == 0 ||
+			    strncmp(de2->d_name, "ttyACM", 6) == 0) {
+				if (!printed_header) {
+					fprintf(out, "DIAG devices:\n");
+					printed_header = 1;
+				}
+				fprintf(out, "  /dev/%-12s  %04x:%04x  iface %d  USB\n",
+					de2->d_name, vid, pid, diag_iface);
+				count++;
+				break;
+			}
+
+			if (strncmp(de2->d_name, "tty", 3) == 0 &&
+			    strlen(de2->d_name) == 3) {
+				snprintf(ttypath, sizeof(ttypath),
+					 "%.511s/tty", path);
+				ttydir = opendir(ttypath);
+				if (!ttydir)
+					continue;
+
+				while ((de3 = readdir(ttydir)) != NULL) {
+					if (strncmp(de3->d_name, "ttyUSB", 6) == 0 ||
+					    strncmp(de3->d_name, "ttyACM", 6) == 0) {
+						if (!printed_header) {
+							fprintf(out, "DIAG devices:\n");
+							printed_header = 1;
+						}
+						fprintf(out, "  /dev/%-12s  %04x:%04x  iface %d  USB\n",
+							de3->d_name, vid, pid,
+							diag_iface);
+						count++;
+						break;
+					}
+				}
+				closedir(ttydir);
+				if (count > 0)
+					break;
+			}
+		}
+		closedir(infdir);
+	}
+
+	closedir(busdir);
+	return count;
+}
+
+static int list_edl_ports(FILE *out)
+{
+	char path[64];
+	int count = 0;
+	int printed_header = 0;
+	int i;
+	const char *types[] = {"BHI", "DIAG", "EDL"};
+	int t;
+
+	for (t = 0; t < 3; t++) {
+		for (i = 0; i < 10; i++) {
+			if (i == 0)
+				snprintf(path, sizeof(path),
+					 "/dev/mhi_%s", types[t]);
+			else
+				snprintf(path, sizeof(path),
+					 "/dev/mhi_%s%d", types[t], i);
+
+			if (access(path, F_OK) != 0)
+				continue;
+
+			if (!printed_header) {
+				fprintf(out, "PCIe MHI devices:\n");
+				printed_header = 1;
+			}
+
+			fprintf(out, "  %-20s  port %d\n", path, i);
+			count++;
+		}
+	}
+
+	return count;
+}
+
+#endif /* _WIN32 */
+
+static int qdl_list(FILE *out)
+{
+	int found = 0;
+	int n;
+
+	n = list_usb_edl(out);
+	found += n;
+
+#ifdef _WIN32
+	{
+		int com_count;
+
+		if (n > 0)
+			fprintf(out, "\n");
+		com_count = list_com_ports(out);
+		found += com_count;
+	}
+#else
+	{
+		int edl_n, diag_n;
+
+		edl_n = list_edl_ports(out);
+		if (edl_n > 0 && n > 0)
+			fprintf(out, "\n");
+		found += edl_n;
+
+		diag_n = list_diag_ports(out);
+		found += diag_n;
+	}
+#endif
+
+	if (!found)
+		fprintf(out, "No devices found\n");
+
+	return found ? 0 : 1;
 }
 
 static int qdl_ramdump(int argc, char **argv)
@@ -1002,6 +1443,833 @@ static int qdl_diag2edl(int argc, char **argv)
 	return 0;
 }
 
+/*
+ * Common Firehose session setup for interactive subcommands.
+ * Opens device, uploads programmer via Sahara (USB) or BHI (PCIe),
+ * configures Firehose.
+ */
+static int firehose_session_open(struct qdl_device **qdl_out, char *programmer,
+				 enum qdl_storage_type storage,
+				 const char *serial, bool use_pcie)
+{
+	struct sahara_image sahara_images[MAPPING_SZ] = {};
+	struct qdl_device *qdl;
+	int ret;
+
+	ret = decode_programmer(programmer, sahara_images);
+	if (ret < 0)
+		return -1;
+
+	qdl = qdl_init(use_pcie ? QDL_DEVICE_PCIE : QDL_DEVICE_USB);
+	if (!qdl)
+		return -1;
+
+	ux_init();
+
+	if (qdl_debug)
+		print_version();
+
+	if (use_pcie) {
+		/*
+		 * PCIe: DIAG→EDL switch + programmer upload.
+		 * Returns 0 if programmer uploaded via BHI (Linux),
+		 * 1 if Sahara still needed (Windows), negative on error.
+		 */
+		int need_sahara;
+
+		need_sahara = pcie_prepare(qdl, sahara_images[0].name);
+		if (need_sahara < 0) {
+			qdl_deinit(qdl);
+			return -1;
+		}
+
+		ret = qdl_open(qdl, serial);
+		if (ret) {
+			qdl_deinit(qdl);
+			return -1;
+		}
+
+		if (need_sahara) {
+			qdl->storage_type = storage;
+			ret = sahara_run(qdl, sahara_images, NULL, NULL);
+			if (ret < 0) {
+				qdl_close(qdl);
+				qdl_deinit(qdl);
+				return -1;
+			}
+		}
+	} else {
+		/* USB: standard Sahara handshake */
+		ret = qdl_open(qdl, serial);
+		if (ret) {
+			qdl_deinit(qdl);
+			return -1;
+		}
+
+		qdl->storage_type = storage;
+
+		ret = sahara_run(qdl, sahara_images, NULL, NULL);
+		if (ret < 0) {
+			qdl_close(qdl);
+			qdl_deinit(qdl);
+			return -1;
+		}
+	}
+
+	qdl->storage_type = storage;
+
+	ux_info("waiting for programmer...\n");
+	ret = firehose_detect_and_configure(qdl, true, storage, 5);
+	if (ret) {
+		qdl_close(qdl);
+		qdl_deinit(qdl);
+		return -1;
+	}
+
+	*qdl_out = qdl;
+	return 0;
+}
+
+static void firehose_session_close(struct qdl_device *qdl, bool do_reset)
+{
+	if (do_reset)
+		firehose_power(qdl, "reset", 1);
+	qdl_close(qdl);
+	qdl_deinit(qdl);
+}
+
+static int qdl_printgpt(int argc, char **argv)
+{
+	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
+	struct qdl_device *qdl = NULL;
+	bool use_pcie = false;
+	char *serial = NULL;
+	int opt;
+	int ret;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"storage", required_argument, 0, 's'},
+		{"pcie", no_argument, 0, 'P'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:s:Ph", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 's':
+			storage_type = decode_storage(optarg);
+			break;
+		case 'P':
+			use_pcie = true;
+			break;
+		case 'h':
+		default:
+			fprintf(stderr, "Usage: qfenix printgpt <programmer> [--debug] [--serial=S] [--storage=T] [--pcie]\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (optind >= argc) {
+		fprintf(stderr, "Error: programmer file required\n");
+		fprintf(stderr, "Usage: qfenix printgpt <programmer> [--debug] [--serial=S] [--storage=T] [--pcie]\n");
+		return 1;
+	}
+
+	ret = firehose_session_open(&qdl, argv[optind], storage_type, serial,
+				    use_pcie);
+	if (ret)
+		return 1;
+
+	ret = gpt_print_table(qdl);
+
+	firehose_session_close(qdl, false);
+	return !!ret;
+}
+
+static int qdl_storageinfo(int argc, char **argv)
+{
+	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
+	struct storage_info info;
+	struct qdl_device *qdl = NULL;
+	bool use_pcie = false;
+	char *serial = NULL;
+	int opt;
+	int ret;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"storage", required_argument, 0, 's'},
+		{"pcie", no_argument, 0, 'P'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:s:Ph", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 's':
+			storage_type = decode_storage(optarg);
+			break;
+		case 'P':
+			use_pcie = true;
+			break;
+		case 'h':
+		default:
+			fprintf(stderr, "Usage: qfenix storageinfo <programmer> [--debug] [--serial=S] [--storage=T] [--pcie]\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (optind >= argc) {
+		fprintf(stderr, "Error: programmer file required\n");
+		return 1;
+	}
+
+	ret = firehose_session_open(&qdl, argv[optind], storage_type, serial,
+				    use_pcie);
+	if (ret)
+		return 1;
+
+	ret = firehose_getstorageinfo(qdl, 0, &info);
+	if (ret == 0) {
+		printf("Storage Information:\n");
+		if (info.mem_type[0])
+			printf("  Memory type:    %s\n", info.mem_type);
+		if (info.prod_name[0])
+			printf("  Product name:   %s\n", info.prod_name);
+		if (info.total_blocks)
+			printf("  Total blocks:   %lu\n", info.total_blocks);
+		if (info.block_size)
+			printf("  Block size:     %u\n", info.block_size);
+		if (info.page_size)
+			printf("  Page size:      %u\n", info.page_size);
+		if (info.sector_size)
+			printf("  Sector size:    %u\n", info.sector_size);
+		if (info.num_physical)
+			printf("  Physical parts: %u\n", info.num_physical);
+	} else {
+		ux_err("failed to get storage info\n");
+	}
+
+	firehose_session_close(qdl, false);
+	return !!ret;
+}
+
+static int qdl_reset(int argc, char **argv)
+{
+	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
+	struct qdl_device *qdl = NULL;
+	const char *mode = "reset";
+	bool use_pcie = false;
+	char *serial = NULL;
+	int opt;
+	int ret;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"storage", required_argument, 0, 's'},
+		{"mode", required_argument, 0, 'm'},
+		{"pcie", no_argument, 0, 'P'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:s:m:Ph", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 's':
+			storage_type = decode_storage(optarg);
+			break;
+		case 'm':
+			mode = optarg;
+			break;
+		case 'P':
+			use_pcie = true;
+			break;
+		case 'h':
+		default:
+			fprintf(stderr, "Usage: qfenix reset <programmer> [--mode=reset|off|edl] [--debug] [--serial=S] [--storage=T] [--pcie]\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (optind >= argc) {
+		fprintf(stderr, "Error: programmer file required\n");
+		return 1;
+	}
+
+	ret = firehose_session_open(&qdl, argv[optind], storage_type, serial,
+				    use_pcie);
+	if (ret)
+		return 1;
+
+	ux_info("sending power command: %s\n", mode);
+	ret = firehose_power(qdl, mode, 1);
+
+	qdl_close(qdl);
+	qdl_deinit(qdl);
+	return !!ret;
+}
+
+static int qdl_getslot(int argc, char **argv)
+{
+	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
+	struct qdl_device *qdl = NULL;
+	bool use_pcie = false;
+	char *serial = NULL;
+	int opt;
+	int ret;
+	int slot;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"storage", required_argument, 0, 's'},
+		{"pcie", no_argument, 0, 'P'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:s:Ph", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 's':
+			storage_type = decode_storage(optarg);
+			break;
+		case 'P':
+			use_pcie = true;
+			break;
+		case 'h':
+		default:
+			fprintf(stderr, "Usage: qfenix getslot <programmer> [--debug] [--serial=S] [--storage=T] [--pcie]\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (optind >= argc) {
+		fprintf(stderr, "Error: programmer file required\n");
+		return 1;
+	}
+
+	ret = firehose_session_open(&qdl, argv[optind], storage_type, serial,
+				    use_pcie);
+	if (ret)
+		return 1;
+
+	slot = gpt_get_active_slot(qdl);
+	if (slot > 0)
+		printf("Active slot: %c\n", slot);
+	else
+		ux_err("failed to determine active slot\n");
+
+	firehose_session_close(qdl, false);
+	return slot > 0 ? 0 : 1;
+}
+
+static int qdl_setslot(int argc, char **argv)
+{
+	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
+	struct qdl_device *qdl = NULL;
+	bool use_pcie = false;
+	char *serial = NULL;
+	char slot;
+	int opt;
+	int ret;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"storage", required_argument, 0, 's'},
+		{"pcie", no_argument, 0, 'P'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:s:Ph", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 's':
+			storage_type = decode_storage(optarg);
+			break;
+		case 'P':
+			use_pcie = true;
+			break;
+		case 'h':
+		default:
+			fprintf(stderr, "Usage: qfenix setslot <a|b> <programmer> [--debug] [--serial=S] [--storage=T] [--pcie]\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (optind >= argc) {
+		fprintf(stderr, "Error: slot (a or b) required\n");
+		return 1;
+	}
+
+	slot = argv[optind][0];
+	if (slot != 'a' && slot != 'b') {
+		fprintf(stderr, "Error: slot must be 'a' or 'b'\n");
+		return 1;
+	}
+	optind++;
+
+	if (optind >= argc) {
+		fprintf(stderr, "Error: programmer file required\n");
+		return 1;
+	}
+
+	ret = firehose_session_open(&qdl, argv[optind], storage_type, serial,
+				    use_pcie);
+	if (ret)
+		return 1;
+
+	ret = gpt_set_active_slot(qdl, slot);
+	if (ret == 0)
+		printf("Active slot set to: %c\n", slot);
+
+	firehose_session_close(qdl, ret == 0);
+	return !!ret;
+}
+
+static int qdl_readall(int argc, char **argv)
+{
+	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
+	struct qdl_device *qdl = NULL;
+	const char *outdir = ".";
+	bool use_pcie = false;
+	char *serial = NULL;
+	int opt;
+	int ret;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"storage", required_argument, 0, 's'},
+		{"output", required_argument, 0, 'o'},
+		{"pcie", no_argument, 0, 'P'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:s:o:Ph", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 's':
+			storage_type = decode_storage(optarg);
+			break;
+		case 'o':
+			outdir = optarg;
+			break;
+		case 'P':
+			use_pcie = true;
+			break;
+		case 'h':
+		default:
+			fprintf(stderr, "Usage: qfenix readall <programmer> [-o outdir] [--debug] [--serial=S] [--storage=T] [--pcie]\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (optind >= argc) {
+		fprintf(stderr, "Error: programmer file required\n");
+		return 1;
+	}
+
+	ret = firehose_session_open(&qdl, argv[optind], storage_type, serial,
+				    use_pcie);
+	if (ret)
+		return 1;
+
+	ret = gpt_read_all_partitions(qdl, outdir);
+
+	firehose_session_close(qdl, false);
+	return !!ret;
+}
+
+static int qdl_nvread(int argc, char **argv)
+{
+	struct diag_session *sess;
+	struct nv_item nv;
+	char *serial = NULL;
+	int opt;
+	int ret;
+	uint16_t item_id;
+	int index = -1;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"index", required_argument, 0, 'I'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:I:h", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 'I':
+			index = (int)strtol(optarg, NULL, 0);
+			break;
+		case 'h':
+		default:
+			fprintf(stderr, "Usage: qfenix nvread <item_id> [--index=N] [--serial=S] [--debug]\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (optind >= argc) {
+		fprintf(stderr, "Error: NV item ID required\n");
+		return 1;
+	}
+
+	item_id = (uint16_t)strtoul(argv[optind], NULL, 0);
+
+	sess = diag_open(serial);
+	if (!sess)
+		return 1;
+
+	if (index >= 0) {
+		ret = diag_nv_read_sub(sess, item_id, (uint16_t)index, &nv);
+	} else {
+		ret = diag_nv_read(sess, item_id, &nv);
+	}
+
+	if (ret == 0) {
+		if (nv.status != NV_DONE_S) {
+			printf("NV item %u: %s (status=%u)\n",
+			       item_id, diag_nv_status_str(nv.status),
+			       nv.status);
+		} else {
+			printf("NV item %u:\n", item_id);
+			print_hex_dump("  ", nv.data, NV_ITEM_DATA_SIZE);
+		}
+	}
+
+	diag_close(sess);
+	return !!ret;
+}
+
+static int qdl_nvwrite(int argc, char **argv)
+{
+	struct diag_session *sess;
+	uint8_t data[NV_ITEM_DATA_SIZE];
+	char *serial = NULL;
+	int opt;
+	int ret;
+	uint16_t item_id;
+	int index = -1;
+	size_t data_len = 0;
+	const char *hex;
+	size_t i;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"index", required_argument, 0, 'I'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:I:h", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 'I':
+			index = (int)strtol(optarg, NULL, 0);
+			break;
+		case 'h':
+		default:
+			fprintf(stderr, "Usage: qfenix nvwrite <item_id> <hex_data> [--index=N] [--serial=S] [--debug]\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (optind + 1 >= argc) {
+		fprintf(stderr, "Error: NV item ID and hex data required\n");
+		return 1;
+	}
+
+	item_id = (uint16_t)strtoul(argv[optind], NULL, 0);
+
+	/* Parse hex string to bytes */
+	hex = argv[optind + 1];
+	memset(data, 0, sizeof(data));
+	for (i = 0; hex[i] && hex[i + 1] && data_len < NV_ITEM_DATA_SIZE; i += 2) {
+		unsigned int byte;
+
+		if (sscanf(&hex[i], "%2x", &byte) != 1) {
+			fprintf(stderr, "Error: invalid hex data at position %zu\n", i);
+			return 1;
+		}
+		data[data_len++] = (uint8_t)byte;
+	}
+
+	sess = diag_open(serial);
+	if (!sess)
+		return 1;
+
+	if (index >= 0)
+		ret = diag_nv_write_sub(sess, item_id, (uint16_t)index,
+					data, data_len);
+	else
+		ret = diag_nv_write(sess, item_id, data, data_len);
+
+	if (ret == 0)
+		printf("NV item %u written successfully\n", item_id);
+
+	diag_close(sess);
+	return !!ret;
+}
+
+static void efsls_print_entry(const struct efs_dirent *entry, void *ctx)
+{
+	const char *type_str;
+
+	(void)ctx;
+
+	if (entry->entry_type == 1)
+		type_str = (entry->mode & 0040000) ? "dir" : "file";
+	else
+		type_str = "???";
+
+	printf("%-4s %8d  %04o  %s\n",
+	       type_str, entry->size, entry->mode & 0777, entry->name);
+}
+
+static int qdl_efsls(int argc, char **argv)
+{
+	struct diag_session *sess;
+	char *serial = NULL;
+	const char *path;
+	int opt;
+	int ret;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:h", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 'h':
+		default:
+			fprintf(stderr, "Usage: qfenix efsls <path> [--serial=S] [--debug]\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (optind >= argc) {
+		fprintf(stderr, "Error: EFS path required\n");
+		return 1;
+	}
+
+	path = argv[optind];
+
+	sess = diag_open(serial);
+	if (!sess)
+		return 1;
+
+	printf("%-4s %8s  %4s  %s\n", "Type", "Size", "Mode", "Name");
+	printf("---- --------  ----  ----\n");
+
+	ret = diag_efs_listdir(sess, path, efsls_print_entry, NULL);
+
+	diag_close(sess);
+	return !!ret;
+}
+
+static int qdl_efsget(int argc, char **argv)
+{
+	struct diag_session *sess;
+	char *serial = NULL;
+	const char *src;
+	const char *dst;
+	int opt;
+	int ret;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:h", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 'h':
+		default:
+			fprintf(stderr, "Usage: qfenix efsget <remote_path> <local_path> [--serial=S] [--debug]\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (optind + 1 >= argc) {
+		fprintf(stderr, "Error: remote path and local path required\n");
+		return 1;
+	}
+
+	src = argv[optind];
+	dst = argv[optind + 1];
+
+	sess = diag_open(serial);
+	if (!sess)
+		return 1;
+
+	ret = diag_efs_readfile(sess, src, dst);
+
+	diag_close(sess);
+	return !!ret;
+}
+
+static int qdl_efsdump(int argc, char **argv)
+{
+	struct diag_session *sess;
+	char *serial = NULL;
+	const char *output;
+	int opt;
+	int ret;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:h", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 'h':
+		default:
+			fprintf(stderr, "Usage: qfenix efsdump <output_file> [--serial=S] [--debug]\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (optind >= argc) {
+		fprintf(stderr, "Error: output file required\n");
+		return 1;
+	}
+
+	output = argv[optind];
+
+	sess = diag_open(serial);
+	if (!sess)
+		return 1;
+
+	ret = diag_efs_dump(sess, output);
+
+	diag_close(sess);
+	return !!ret;
+}
+
 static int qdl_flash(int argc, char **argv)
 {
 	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
@@ -1042,11 +2310,12 @@ static int qdl_flash(int argc, char **argv)
 		{"no-auto-edl", no_argument, 0, 'E'},
 		{"skip-md5", no_argument, 0, 'M'},
 		{"firmware-dir", required_argument, 0, 'F'},
+		{"pcie", no_argument, 0, 'P'},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
 
-	while ((opt = getopt_long(argc, argv, "dvi:lu:S:D:s:fcnt:T:EMF:h", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "dvi:lu:S:D:s:fcnt:T:EMF:Ph", options, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			qdl_debug = true;
@@ -1098,6 +2367,9 @@ static int qdl_flash(int argc, char **argv)
 			break;
 		case 'F':
 			firmware_dir = optarg;
+			break;
+		case 'P':
+			qdl_dev_type = QDL_DEVICE_PCIE;
 			break;
 		case 'h':
 			print_usage(stdout);
@@ -1263,15 +2535,38 @@ static int qdl_flash(int argc, char **argv)
 	if (ret < 0)
 		goto out_cleanup;
 
-	ret = qdl_open(qdl, serial);
-	if (ret)
-		goto out_cleanup;
+	if (qdl_dev_type == QDL_DEVICE_PCIE) {
+		/*
+		 * PCIe: DIAG→EDL switch + programmer upload.
+		 * Returns 0 if programmer uploaded via BHI (Linux),
+		 * 1 if Sahara still needed (Windows), negative on error.
+		 */
+		int need_sahara;
+
+		need_sahara = pcie_prepare(qdl, sahara_images[0].name);
+		if (need_sahara < 0)
+			goto out_cleanup;
+
+		ret = qdl_open(qdl, serial);
+		if (ret)
+			goto out_cleanup;
+
+		if (need_sahara) {
+			ret = sahara_run(qdl, sahara_images, NULL, NULL);
+			if (ret < 0)
+				goto out_cleanup;
+		}
+	} else {
+		ret = qdl_open(qdl, serial);
+		if (ret)
+			goto out_cleanup;
+
+		ret = sahara_run(qdl, sahara_images, NULL, NULL);
+		if (ret < 0)
+			goto out_cleanup;
+	}
 
 	qdl->storage_type = storage_type;
-
-	ret = sahara_run(qdl, sahara_images, NULL, NULL);
-	if (ret < 0)
-		goto out_cleanup;
 
 	if (ufs_need_provisioning())
 		ret = firehose_provision(qdl);
@@ -1310,6 +2605,28 @@ int main(int argc, char **argv)
 		return qdl_ks(argc - 1, argv + 1);
 	if (argc >= 2 && !strcmp(argv[1], "diag2edl"))
 		return qdl_diag2edl(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "printgpt"))
+		return qdl_printgpt(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "storageinfo"))
+		return qdl_storageinfo(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "reset"))
+		return qdl_reset(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "getslot"))
+		return qdl_getslot(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "setslot"))
+		return qdl_setslot(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "readall"))
+		return qdl_readall(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "nvread"))
+		return qdl_nvread(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "nvwrite"))
+		return qdl_nvwrite(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "efsls"))
+		return qdl_efsls(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "efsget"))
+		return qdl_efsget(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "efsdump"))
+		return qdl_efsdump(argc - 1, argv + 1);
 
 	return qdl_flash(argc, argv);
 }

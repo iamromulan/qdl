@@ -11,6 +11,7 @@
 #include "oscompat.h"
 
 #include "qdl.h"
+#include "usb_ids.h"
 #include "diag_switch.h"
 
 #define DEFAULT_OUT_CHUNK_SIZE (1024 * 1024)
@@ -86,10 +87,8 @@ static int usb_try_open(libusb_device *dev, struct qdl_device_usb *qdl, const ch
 		return -1;
 	}
 
-	/* Consider only devices with vid 0x0506 and known product id */
-	if (desc.idVendor != 0x05c6)
-		return 0;
-	if (desc.idProduct != 0x9008 && desc.idProduct != 0x900e && desc.idProduct != 0x901d)
+	/* Consider only known EDL-mode devices */
+	if (!is_edl_device(desc.idVendor, desc.idProduct))
 		return 0;
 
 	ret = libusb_get_active_config_descriptor(dev, &config);
@@ -276,9 +275,7 @@ struct qdl_device_desc *usb_list(unsigned int *devices_found)
 			continue;
 		}
 
-		if (desc.idVendor != 0x05c6)
-			continue;
-		if (desc.idProduct != 0x9008 && desc.idProduct != 0x900e && desc.idProduct != 0x901d)
+		if (!is_edl_device(desc.idVendor, desc.idProduct))
 			continue;
 
 		ret = libusb_open(dev, &handle);

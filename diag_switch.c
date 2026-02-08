@@ -56,14 +56,41 @@ static int is_skip_port_name(const char *name)
 	return 0;
 }
 
+/*
+ * Check if a friendly name indicates a Qualcomm modem.
+ * Used for PCIe/MHI devices that don't expose USB VID/PID.
+ */
+static int is_qualcomm_modem_name(const char *name)
+{
+	if (strstr(name, "Qualcomm") || strstr(name, "Snapdragon") ||
+	    strstr(name, "QDLoader") || strstr(name, "Sahara") ||
+	    strstr(name, "QCOM") || strstr(name, "SDX") ||
+	    strstr(name, "DW59") || strstr(name, "DW58") ||
+	    strstr(name, "Quectel") || strstr(name, "Sierra") ||
+	    strstr(name, "Fibocom") || strstr(name, "Telit") ||
+	    strstr(name, "Foxconn") || strstr(name, "T99W") ||
+	    strstr(name, "EM91") || strstr(name, "EM92") ||
+	    strstr(name, "FM150") || strstr(name, "FM160") ||
+	    strstr(name, "SIM82") || strstr(name, "SIM83") ||
+	    strstr(name, "RM5") || strstr(name, "RM2"))
+		return 1;
+	return 0;
+}
+
 static int detect_diag_port_win(char *port_buf, size_t buf_size,
-				const char *serial __unused)
+				const char *serial)
 {
 	HDEVINFO hDevInfo;
 	SP_DEVINFO_DATA devInfoData;
 	DWORD i;
 	int found = 0;
 	char fallback_port[32] = {0};
+
+	/* Direct COM port specification bypasses auto-detection */
+	if (serial && strncmp(serial, "COM", 3) == 0) {
+		snprintf(port_buf, buf_size, "%s", serial);
+		return 1;
+	}
 
 	hDevInfo = SetupDiGetClassDevsA(&GUID_DEVCLASS_PORTS_LOCAL, NULL, NULL,
 					DIGCF_PRESENT);
@@ -79,13 +106,14 @@ static int detect_diag_port_win(char *port_buf, size_t buf_size,
 		HKEY hKey;
 		DWORD size;
 		int vid = 0, pid = 0;
+		int is_known_vendor = 0;
 
 		if (!SetupDiGetDeviceRegistryPropertyA(hDevInfo, &devInfoData,
 				SPDRP_HARDWAREID, NULL, (PBYTE)hwid,
 				sizeof(hwid), NULL))
 			continue;
 
-		/* Parse VID and PID from hardware ID string */
+		/* Parse VID and PID from hardware ID string (USB devices) */
 		char *vidStr = strstr(hwid, "VID_");
 		char *pidStr = strstr(hwid, "PID_");
 
@@ -94,19 +122,29 @@ static int detect_diag_port_win(char *port_buf, size_t buf_size,
 		if (pidStr)
 			pid = strtol(pidStr + 4, NULL, 16);
 
-		/* Check for Qualcomm/Quectel devices */
-		if (vid != DIAG_VID_QUECTEL && vid != DIAG_VID_QUALCOMM &&
-		    vid != DIAG_VID_OTHER1 && vid != DIAG_VID_OTHER2)
-			continue;
-
-		/* Skip if already in EDL mode */
-		if (vid == EDL_VID && (pid == EDL_PID_9008 ||
-		    pid == EDL_PID_900E || pid == EDL_PID_901D))
-			continue;
-
 		SetupDiGetDeviceRegistryPropertyA(hDevInfo, &devInfoData,
 			SPDRP_FRIENDLYNAME, NULL, (PBYTE)friendlyName,
 			sizeof(friendlyName), NULL);
+
+		if (vidStr) {
+			/* USB device: check VID against known DIAG vendors */
+			if (!is_diag_vendor(vid))
+				continue;
+			if (is_edl_device(vid, pid))
+				continue;
+			is_known_vendor = 1;
+		} else {
+			/*
+			 * No VID_ in hardware ID — likely a PCIe/MHI device.
+			 * Fall back to matching by friendly name keywords.
+			 */
+			if (!is_qualcomm_modem_name(friendlyName))
+				continue;
+			is_known_vendor = 1;
+		}
+
+		if (!is_known_vendor)
+			continue;
 
 		hKey = SetupDiOpenDevRegKey(hDevInfo, &devInfoData,
 					    DICS_FLAG_GLOBAL, 0, DIREG_DEV,
@@ -243,27 +281,10 @@ static int str_starts_with(const char *str, const char *prefix)
 	return strncmp(str, prefix, strlen(prefix)) == 0;
 }
 
-/* Known USB interface numbers for DIAG port on various modules */
+/* Look up DIAG interface number for a given VID/PID */
 static int get_diag_interface(int vid, int pid)
 {
-	if (vid == DIAG_VID_QUECTEL) {
-		switch (pid) {
-		/* Laptop modules: EM05, EM06, EM12, RM520, etc. */
-		case 0x0127: case 0x0310: case 0x030a: case 0x0311:
-		case 0x0315: case 0x0309: case 0x6008: case 0x0128:
-		case 0x6009: case 0x0803: case 0x012E: case 0x012F:
-		case 0x0804: case 0x030d: case 0x0139: case 0x012c:
-		case 0x013c:
-			return 3;
-		case 0x0514: case 0x0133: case 0x030b:
-			return 2;
-		}
-	} else if (vid == DIAG_VID_QUALCOMM && pid == 0x90db) {
-		return 2;
-	} else if (vid == DIAG_VID_OTHER1 && pid == 0xffff) {
-		return 8;
-	}
-	return 0;
+	return get_diag_interface_num(vid, pid);
 }
 
 static int poll_wait(int fd, short events, int timeout_ms)
@@ -312,28 +333,26 @@ static int detect_diag_port_linux(char *port_buf, size_t buf_size,
 			line[strcspn(line, "\r\n")] = 0;
 			if (str_starts_with(line, "MAJOR="))
 				major = atoi(line + 6);
-			else if (str_starts_with(line, "DEVTYPE=")) {
-				snprintf(devtype, sizeof(devtype), "%s", line + 8);
-			} else if (str_starts_with(line, "PRODUCT=")) {
-				snprintf(product, sizeof(product), "%s", line + 8);
-			}
+			else if (str_starts_with(line, "DEVTYPE="))
+				snprintf(devtype, sizeof(devtype),
+					 "%.63s", line + 8);
+			else if (str_starts_with(line, "PRODUCT="))
+				snprintf(product, sizeof(product),
+					 "%.63s", line + 8);
 		}
 		fclose(fp);
 
 		if (major != 189 || !str_starts_with(devtype, "usb_device"))
 			continue;
 
-		/* Check for Qualcomm/Quectel vendor */
-		if (!(str_starts_with(product, "2c7c/") ||
-		      str_starts_with(product, "5c6/") ||
-		      str_starts_with(product, "3c93/") ||
-		      str_starts_with(product, "3763/")))
+		sscanf(product, "%x/%x", &vid, &pid);
+
+		/* Check for supported DIAG-mode vendor */
+		if (!is_diag_vendor(vid))
 			continue;
 
 		/* Skip if already in EDL mode */
-		if (str_starts_with(product, "5c6/9008") ||
-		    str_starts_with(product, "5c6/900e") ||
-		    str_starts_with(product, "5c6/901d"))
+		if (is_edl_device(vid, pid))
 			continue;
 
 		/* Read serial number if filter is specified */
@@ -350,7 +369,6 @@ static int detect_diag_port_linux(char *port_buf, size_t buf_size,
 				continue;
 		}
 
-		sscanf(product, "%x/%x", &vid, &pid);
 		diag_iface = get_diag_interface(vid, pid);
 
 		/* Look for ttyUSB in interface directory */
@@ -388,7 +406,7 @@ static int detect_diag_port_linux(char *port_buf, size_t buf_size,
 								    "ttyACM")) {
 							snprintf(port_buf,
 								 buf_size,
-								 "/dev/%s",
+								 "/dev/%.240s",
 								 de3->d_name);
 							found = 1;
 							break;
