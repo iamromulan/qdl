@@ -602,7 +602,7 @@ static int pcie_read_win(struct qdl_device *qdl, void *buf, size_t len,
 	 */
 	do {
 		if (!ReadFile(pcie->hSerial, buf, (DWORD)len, &n, NULL))
-			return -1;
+			return -EIO;
 
 		if (n > 0)
 			return (int)n;
@@ -610,7 +610,7 @@ static int pcie_read_win(struct qdl_device *qdl, void *buf, size_t len,
 		Sleep(10);
 	} while (GetTickCount() < deadline);
 
-	return -1;
+	return -ETIMEDOUT;
 }
 
 static int pcie_write_win(struct qdl_device *qdl, const void *buf, size_t len,
@@ -624,7 +624,7 @@ static int pcie_write_win(struct qdl_device *qdl, const void *buf, size_t len,
 	pcie = container_of(qdl, struct qdl_device_pcie_win, base);
 
 	if (!WriteFile(pcie->hSerial, buf, (DWORD)len, &written, NULL))
-		return -1;
+		return -EIO;
 
 	return (int)written;
 }
