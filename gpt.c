@@ -19,6 +19,223 @@
 
 #include "qdl.h"
 #include "gpt.h"
+#include "read.h"
+
+/*
+ * SMEM Flash Partition Table (MIBIB) — Qualcomm NAND partition format.
+ *
+ * On NAND devices, partition info is stored in the MIBIB (Multi-Image Boot
+ * Information Block) rather than GPT. The MIBIB contains an MBN header at
+ * page 0 and the SMEM partition table at page 1.
+ *
+ * Offsets and lengths in partition entries are in NAND erase block units.
+ */
+#define NAND_BOOT_CODEWORD		0x844BDCD1
+
+#define MBN_HEADER_MAGIC1		0xFE569FAC
+#define MBN_HEADER_MAGIC2		0xCD7F127A
+
+#define SMEM_FLASH_PART_MAGIC1		0x55EE73AA
+#define SMEM_FLASH_PART_MAGIC2		0xE35EBDDB
+#define SMEM_FLASH_PTABLE_V3		3
+#define SMEM_FLASH_PTABLE_V4		4
+#define SMEM_FLASH_PTABLE_MAX_PARTS_V3	16
+#define SMEM_FLASH_PTABLE_MAX_PARTS_V4	48
+#define SMEM_FLASH_PTABLE_NAME_SIZE	16
+
+struct smem_flash_pentry {
+	char     name[SMEM_FLASH_PTABLE_NAME_SIZE];
+	uint32_t offset;	/* in erase blocks */
+	uint32_t length;	/* in erase blocks */
+	uint8_t  attr;
+	uint8_t  attr2;
+	uint8_t  attr3;
+	uint8_t  which_flash;
+} __attribute__((packed));
+
+struct smem_flash_ptable {
+	uint32_t magic1;
+	uint32_t magic2;
+	uint32_t version;
+	uint32_t numparts;
+	struct smem_flash_pentry pentry[SMEM_FLASH_PTABLE_MAX_PARTS_V4];
+} __attribute__((packed));
+
+/*
+ * Try to detect NAND page size by reading sector 0 with different sizes.
+ * Returns the working sector size, or 0 on failure.
+ */
+static size_t nand_detect_sector_size(struct qdl_device *qdl)
+{
+	static const size_t sizes[] = { 4096, 2048 };
+	uint8_t buf[4096];
+	struct read_op op;
+	size_t i;
+	int ret;
+
+	memset(&op, 0, sizeof(op));
+	op.partition = 0;
+	op.start_sector = "0";
+	op.num_sectors = 1;
+
+	for (i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+		op.sector_size = sizes[i];
+		ret = firehose_read_buf(qdl, &op, buf, sizes[i]);
+		if (ret == 0)
+			return sizes[i];
+	}
+
+	return 0;
+}
+
+/*
+ * Scan for the MIBIB block by checking known sector offsets.
+ * Returns the sector number of the MBN header, or -1 if not found.
+ */
+static int nand_find_mibib(struct qdl_device *qdl, size_t sector_size)
+{
+	static const unsigned int candidates[] = { 0x280, 0x400, 0x800 };
+	uint8_t buf[4096];
+	struct read_op op;
+	uint32_t magic1, magic2;
+	size_t i;
+	int ret;
+
+	memset(&op, 0, sizeof(op));
+	op.partition = 0;
+	op.num_sectors = 1;
+	op.sector_size = sector_size;
+
+	for (i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+		char sector_str[16];
+
+		snprintf(sector_str, sizeof(sector_str), "%u", candidates[i]);
+		op.start_sector = sector_str;
+
+		ret = firehose_read_buf(qdl, &op, buf, sector_size);
+		if (ret)
+			continue;
+
+		memcpy(&magic1, buf, 4);
+		memcpy(&magic2, buf + 4, 4);
+
+		/* Check for MBN header */
+		if (magic1 == MBN_HEADER_MAGIC1 && magic2 == MBN_HEADER_MAGIC2)
+			return candidates[i];
+
+		/* Check for SMEM partition table directly */
+		if (magic1 == SMEM_FLASH_PART_MAGIC1 &&
+		    magic2 == SMEM_FLASH_PART_MAGIC2)
+			return candidates[i] - 1;
+	}
+
+	return -1;
+}
+
+/*
+ * Read and print the NAND partition table from MIBIB.
+ */
+static int nand_print_partitions(struct qdl_device *qdl)
+{
+	struct smem_flash_ptable ptable;
+	uint8_t buf[8192];
+	struct read_op op;
+	size_t sector_size;
+	unsigned int max_parts;
+	char sector_str[16];
+	char name[SMEM_FLASH_PTABLE_NAME_SIZE + 1];
+	int mibib_sector;
+	unsigned int i;
+	int ret;
+
+	/* Detect NAND page/sector size */
+	sector_size = qdl->sector_size;
+	if (!sector_size)
+		sector_size = nand_detect_sector_size(qdl);
+	if (!sector_size) {
+		ux_err("failed to detect NAND page size\n");
+		return -1;
+	}
+	qdl->sector_size = sector_size;
+
+	/* Find MIBIB block */
+	mibib_sector = nand_find_mibib(qdl, sector_size);
+	if (mibib_sector < 0) {
+		ux_err("MIBIB partition table not found\n");
+		return -1;
+	}
+
+	ux_debug("found MIBIB at sector %d\n", mibib_sector);
+
+	/* Read partition table (page after MBN header) */
+	memset(&op, 0, sizeof(op));
+	op.partition = 0;
+	op.num_sectors = 2;
+	op.sector_size = sector_size;
+	snprintf(sector_str, sizeof(sector_str), "%u", mibib_sector + 1);
+	op.start_sector = sector_str;
+
+	memset(buf, 0, sizeof(buf));
+	ret = firehose_read_buf(qdl, &op, buf, sector_size * 2);
+	if (ret) {
+		ux_err("failed to read MIBIB partition table\n");
+		return -1;
+	}
+
+	/* Parse SMEM header */
+	memcpy(&ptable, buf, sizeof(ptable));
+
+	if (ptable.magic1 != SMEM_FLASH_PART_MAGIC1 ||
+	    ptable.magic2 != SMEM_FLASH_PART_MAGIC2) {
+		ux_err("invalid SMEM partition table magic "
+		       "(got 0x%08x 0x%08x, expected 0x%08x 0x%08x)\n",
+		       ptable.magic1, ptable.magic2,
+		       SMEM_FLASH_PART_MAGIC1, SMEM_FLASH_PART_MAGIC2);
+		return -1;
+	}
+
+	if (ptable.version == SMEM_FLASH_PTABLE_V3)
+		max_parts = SMEM_FLASH_PTABLE_MAX_PARTS_V3;
+	else
+		max_parts = SMEM_FLASH_PTABLE_MAX_PARTS_V4;
+
+	if (ptable.numparts > max_parts) {
+		ux_err("SMEM partition table has %u entries (max %u)\n",
+		       ptable.numparts, max_parts);
+		return -1;
+	}
+
+	printf("\n=== NAND Partition Table (MIBIB/SMEM v%u) ===\n",
+	       ptable.version);
+	printf("Page size: %zu bytes\n", sector_size);
+	printf("Partitions: %u\n\n", ptable.numparts);
+	printf("%-4s %-24s %12s %12s %6s\n",
+	       "#", "Name", "Offset(blk)", "Length(blk)", "Attr");
+	printf("%-4s %-24s %12s %12s %6s\n",
+	       "---", "------------------------",
+	       "------------", "------------", "------");
+
+	for (i = 0; i < ptable.numparts; i++) {
+		struct smem_flash_pentry *e = &ptable.pentry[i];
+
+		/* Copy name and null-terminate */
+		memcpy(name, e->name, SMEM_FLASH_PTABLE_NAME_SIZE);
+		name[SMEM_FLASH_PTABLE_NAME_SIZE] = '\0';
+
+		/* Strip "0:" prefix if present */
+		const char *display_name = name;
+		if (name[0] == '0' && name[1] == ':')
+			display_name = name + 2;
+
+		printf("%-4u %-24s %12u %12u  0x%02x\n",
+		       i, display_name, e->offset, e->length, e->attr);
+	}
+
+	printf("\nNote: offsets and lengths are in NAND erase blocks\n");
+	return 0;
+}
+
+/* GPT structures for eMMC/UFS/NVMe block devices */
 
 struct gpt_guid {
 	uint32_t data1;
@@ -430,6 +647,9 @@ int gpt_print_table(struct qdl_device *qdl)
 	unsigned int i;
 	bool eof = false;
 	int ret = 0;
+
+	if (qdl->storage_type == QDL_STORAGE_NAND)
+		return nand_print_partitions(qdl);
 
 	for (i = 0; ; i++) {
 		ret = gpt_print_table_from_partition(qdl, i, &eof);

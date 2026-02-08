@@ -225,22 +225,26 @@ static int firehose_write(struct qdl_device *qdl, xmlDoc *doc)
 
 	vip_gen_chunk_init(qdl);
 
-	for (;;) {
-		ux_debug("FIREHOSE WRITE: %s\n", s);
-		vip_gen_chunk_update(qdl, s, len);
-		ret = qdl_write(qdl, s, len, 1000);
-		saved_errno = errno;
+	{
+		int retries = 10;
 
-		/*
-		 * db410c sometimes sense a <response> followed by <log>
-		 * entries and won't accept write commands until these are
-		 * drained, so attempt to read any pending data and then retry
-		 * the write.
-		 */
-		if (ret < 0 && errno == ETIMEDOUT) {
-			firehose_read(qdl, 100, firehose_generic_parser, NULL);
-		} else {
-			break;
+		for (;;) {
+			ux_debug("FIREHOSE WRITE: %s\n", s);
+			vip_gen_chunk_update(qdl, s, len);
+			ret = qdl_write(qdl, s, len, 1000);
+			saved_errno = errno;
+
+			/*
+			 * db410c sometimes sends a <response> followed by
+			 * <log> entries and won't accept write commands
+			 * until these are drained, so attempt to read any
+			 * pending data and then retry the write.
+			 */
+			if (ret < 0 && errno == ETIMEDOUT && retries-- > 0) {
+				firehose_read(qdl, 100, firehose_generic_parser, NULL);
+			} else {
+				break;
+			}
 		}
 	}
 	xmlFree(s);
@@ -1076,6 +1080,7 @@ static int firehose_getstorageinfo_parser(xmlNode *node, void *data,
 	if (xmlStrcmp(node->name, (xmlChar *)"log") == 0) {
 		ux_log("LOG: %s\n", text);
 
+		/* Parse key=value format (UFS/eMMC programmers) */
 		if ((eq = strstr(text, "total_blocks=")))
 			info->total_blocks = strtoul(eq + 13, NULL, 0);
 		if ((eq = strstr(text, "block_size=")))
@@ -1092,6 +1097,36 @@ static int firehose_getstorageinfo_parser(xmlNode *node, void *data,
 		if ((eq = strstr(text, "prod_name=")))
 			snprintf(info->prod_name, sizeof(info->prod_name),
 				 "%s", eq + 10);
+
+		/* Parse JSON format (NAND programmers) */
+		if ((eq = strstr(text, "\"total_blocks\":")))
+			info->total_blocks = strtoul(eq + 15, NULL, 0);
+		if ((eq = strstr(text, "\"block_size\":")))
+			info->block_size = strtoul(eq + 13, NULL, 0);
+		if ((eq = strstr(text, "\"page_size\":")))
+			info->page_size = strtoul(eq + 12, NULL, 0);
+		if ((eq = strstr(text, "\"num_physical\":")))
+			info->num_physical = strtoul(eq + 15, NULL, 0);
+		if ((eq = strstr(text, "\"mem_type\":\""))) {
+			char *end = strchr(eq + 12, '"');
+			if (end) {
+				size_t len = end - (eq + 12);
+				if (len >= sizeof(info->mem_type))
+					len = sizeof(info->mem_type) - 1;
+				memcpy(info->mem_type, eq + 12, len);
+				info->mem_type[len] = '\0';
+			}
+		}
+		if ((eq = strstr(text, "\"prod_name\":\""))) {
+			char *end = strchr(eq + 13, '"');
+			if (end) {
+				size_t len = end - (eq + 13);
+				if (len >= sizeof(info->prod_name))
+					len = sizeof(info->prod_name) - 1;
+				memcpy(info->prod_name, eq + 13, len);
+				info->prod_name[len] = '\0';
+			}
+		}
 
 		ret = -EAGAIN;
 	} else if (xmlStrcmp(value, (xmlChar *)"ACK") == 0) {

@@ -598,6 +598,30 @@ static char *find_programmer_recursive(const char *base_dir)
 	return NULL;
 }
 
+/*
+ * Detect storage type from rawprogram XMLs in a directory.
+ * Returns detected type, or QDL_STORAGE_UFS as default.
+ */
+static enum qdl_storage_type detect_storage_from_directory(const char *base_dir)
+{
+	enum qdl_storage_type storage;
+	char **rawprogram = NULL;
+	int count = 0;
+
+	find_files_recursive(base_dir, "rawprogram", ".xml",
+			     &rawprogram, &count);
+	if (count > 0) {
+		storage = detect_storage_from_filename(rawprogram[0]);
+		while (count > 0)
+			free(rawprogram[--count]);
+		free(rawprogram);
+		return storage;
+	}
+
+	free(rawprogram);
+	return QDL_STORAGE_UFS;
+}
+
 static int firmware_detect(const char *base_dir, struct firmware_files *fw)
 {
 	char *dir_buf;
@@ -1570,6 +1594,7 @@ static int qdl_printgpt(int argc, char **argv)
 	struct qdl_device *qdl = NULL;
 	char *loader_dir = NULL;
 	char *programmer = NULL;
+	bool storage_set = false;
 	bool use_pcie = false;
 	char *serial = NULL;
 	int opt;
@@ -1599,6 +1624,7 @@ static int qdl_printgpt(int argc, char **argv)
 			break;
 		case 's':
 			storage_type = decode_storage(optarg);
+			storage_set = true;
 			break;
 		case 'L':
 			loader_dir = optarg;
@@ -1619,6 +1645,8 @@ static int qdl_printgpt(int argc, char **argv)
 			fprintf(stderr, "Error: no programmer found in %s\n", loader_dir);
 			return 1;
 		}
+		if (!storage_set)
+			storage_type = detect_storage_from_directory(loader_dir);
 	} else if (optind >= argc) {
 		fprintf(stderr, "Error: programmer file or -L <dir> required\n");
 		fprintf(stderr, "Usage: qfenix printgpt [-L dir | <programmer>] [--serial=S] [--storage=T] [--pcie]\n");
@@ -1634,7 +1662,7 @@ static int qdl_printgpt(int argc, char **argv)
 
 	ret = gpt_print_table(qdl);
 
-	firehose_session_close(qdl, false);
+	firehose_session_close(qdl, true);
 	free(programmer);
 	return !!ret;
 }
@@ -1646,6 +1674,7 @@ static int qdl_storageinfo(int argc, char **argv)
 	struct qdl_device *qdl = NULL;
 	char *loader_dir = NULL;
 	char *programmer = NULL;
+	bool storage_set = false;
 	bool use_pcie = false;
 	char *serial = NULL;
 	int opt;
@@ -1675,6 +1704,7 @@ static int qdl_storageinfo(int argc, char **argv)
 			break;
 		case 's':
 			storage_type = decode_storage(optarg);
+			storage_set = true;
 			break;
 		case 'L':
 			loader_dir = optarg;
@@ -1695,6 +1725,8 @@ static int qdl_storageinfo(int argc, char **argv)
 			fprintf(stderr, "Error: no programmer found in %s\n", loader_dir);
 			return 1;
 		}
+		if (!storage_set)
+			storage_type = detect_storage_from_directory(loader_dir);
 	} else if (optind >= argc) {
 		fprintf(stderr, "Error: programmer file or -L <dir> required\n");
 		return 1;
@@ -1728,7 +1760,7 @@ static int qdl_storageinfo(int argc, char **argv)
 		ux_err("failed to get storage info\n");
 	}
 
-	firehose_session_close(qdl, false);
+	firehose_session_close(qdl, true);
 	free(programmer);
 	return !!ret;
 }
@@ -1740,6 +1772,7 @@ static int qdl_reset(int argc, char **argv)
 	const char *mode = "reset";
 	char *loader_dir = NULL;
 	char *programmer = NULL;
+	bool storage_set = false;
 	bool use_pcie = false;
 	char *serial = NULL;
 	int opt;
@@ -1770,6 +1803,7 @@ static int qdl_reset(int argc, char **argv)
 			break;
 		case 's':
 			storage_type = decode_storage(optarg);
+			storage_set = true;
 			break;
 		case 'm':
 			mode = optarg;
@@ -1793,6 +1827,8 @@ static int qdl_reset(int argc, char **argv)
 			fprintf(stderr, "Error: no programmer found in %s\n", loader_dir);
 			return 1;
 		}
+		if (!storage_set)
+			storage_type = detect_storage_from_directory(loader_dir);
 	} else if (optind >= argc) {
 		fprintf(stderr, "Error: programmer file or -L <dir> required\n");
 		return 1;
@@ -1820,6 +1856,7 @@ static int qdl_getslot(int argc, char **argv)
 	struct qdl_device *qdl = NULL;
 	char *loader_dir = NULL;
 	char *programmer = NULL;
+	bool storage_set = false;
 	bool use_pcie = false;
 	char *serial = NULL;
 	int opt;
@@ -1850,6 +1887,7 @@ static int qdl_getslot(int argc, char **argv)
 			break;
 		case 's':
 			storage_type = decode_storage(optarg);
+			storage_set = true;
 			break;
 		case 'L':
 			loader_dir = optarg;
@@ -1870,6 +1908,8 @@ static int qdl_getslot(int argc, char **argv)
 			fprintf(stderr, "Error: no programmer found in %s\n", loader_dir);
 			return 1;
 		}
+		if (!storage_set)
+			storage_type = detect_storage_from_directory(loader_dir);
 	} else if (optind >= argc) {
 		fprintf(stderr, "Error: programmer file or -L <dir> required\n");
 		return 1;
@@ -1888,7 +1928,7 @@ static int qdl_getslot(int argc, char **argv)
 	else
 		ux_err("failed to determine active slot\n");
 
-	firehose_session_close(qdl, false);
+	firehose_session_close(qdl, true);
 	free(programmer);
 	return slot > 0 ? 0 : 1;
 }
@@ -1899,6 +1939,7 @@ static int qdl_setslot(int argc, char **argv)
 	struct qdl_device *qdl = NULL;
 	char *loader_dir = NULL;
 	char *programmer = NULL;
+	bool storage_set = false;
 	bool use_pcie = false;
 	char *serial = NULL;
 	char slot;
@@ -1929,6 +1970,7 @@ static int qdl_setslot(int argc, char **argv)
 			break;
 		case 's':
 			storage_type = decode_storage(optarg);
+			storage_set = true;
 			break;
 		case 'L':
 			loader_dir = optarg;
@@ -1961,6 +2003,8 @@ static int qdl_setslot(int argc, char **argv)
 			fprintf(stderr, "Error: no programmer found in %s\n", loader_dir);
 			return 1;
 		}
+		if (!storage_set)
+			storage_type = detect_storage_from_directory(loader_dir);
 	} else if (optind >= argc) {
 		fprintf(stderr, "Error: programmer file or -L <dir> required\n");
 		return 1;
@@ -1989,6 +2033,7 @@ static int qdl_readall(int argc, char **argv)
 	const char *outdir = ".";
 	char *loader_dir = NULL;
 	char *programmer = NULL;
+	bool storage_set = false;
 	bool use_pcie = false;
 	char *serial = NULL;
 	int opt;
@@ -2019,6 +2064,7 @@ static int qdl_readall(int argc, char **argv)
 			break;
 		case 's':
 			storage_type = decode_storage(optarg);
+			storage_set = true;
 			break;
 		case 'o':
 			outdir = optarg;
@@ -2042,6 +2088,8 @@ static int qdl_readall(int argc, char **argv)
 			fprintf(stderr, "Error: no programmer found in %s\n", loader_dir);
 			return 1;
 		}
+		if (!storage_set)
+			storage_type = detect_storage_from_directory(loader_dir);
 	} else if (optind >= argc) {
 		fprintf(stderr, "Error: programmer file or -L <dir> required\n");
 		return 1;
@@ -2056,7 +2104,7 @@ static int qdl_readall(int argc, char **argv)
 
 	ret = gpt_read_all_partitions(qdl, outdir);
 
-	firehose_session_close(qdl, false);
+	firehose_session_close(qdl, true);
 	free(programmer);
 	return !!ret;
 }
@@ -2527,6 +2575,8 @@ static int qdl_flash(int argc, char **argv)
 			ux_err("no programmer found in %s\n", loader_dir);
 			return 1;
 		}
+		if (!storage_type_set)
+			storage_type = detect_storage_from_directory(loader_dir);
 		/* Still require XML files as positional args */
 		if ((optind + 1) > argc) {
 			fprintf(stderr, "Error: XML files required with -L\n");
