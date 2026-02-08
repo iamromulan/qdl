@@ -569,6 +569,10 @@ static int pcie_open_win(struct qdl_device *qdl, const char *serial)
 
 	pcie->hSerial = hSerial;
 	ux_info("EDL port %s opened\n", port);
+
+	/* Let the device finish initializing and send the Sahara hello */
+	Sleep(1000);
+
 	return 0;
 }
 
@@ -596,12 +600,16 @@ static int pcie_read_win(struct qdl_device *qdl, void *buf, size_t len,
 		if (wait == WAIT_TIMEOUT) {
 			CancelIo(pcie->hSerial);
 			GetOverlappedResult(pcie->hSerial, &ov, &n, TRUE);
-		} else if (wait == WAIT_OBJECT_0) {
-			GetOverlappedResult(pcie->hSerial, &ov, &n, FALSE);
-		} else {
+			if (n == 0)
+				goto out;
+		} else if (wait != WAIT_OBJECT_0) {
 			CancelIo(pcie->hSerial);
 			goto out;
 		}
+
+		if (!GetOverlappedResult(pcie->hSerial, &ov, &n, FALSE) &&
+		    n == 0)
+			goto out;
 	}
 
 	ret = (n > 0) ? (int)n : -1;

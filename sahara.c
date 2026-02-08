@@ -489,10 +489,11 @@ int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 			 * On COM port transport (Windows QDLoader/PCIe),
 			 * the initial Sahara hello may have been lost if
 			 * it was sent before the port was opened.  Send
-			 * periodic reset commands to make the device
-			 * resend it.
+			 * a reset command after several failures to make
+			 * the device resend it.  Don't send resets too
+			 * early — the hello may still be in transit.
 			 */
-			if (!done && retries % 3 == 0)
+			if (!done && retries == 10)
 				sahara_send_reset(qdl);
 		} while (--retries > 0);
 
