@@ -446,6 +446,7 @@ int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 {
 	struct sahara_pkt *pkt;
 	char buf[4096];
+	size_t buf_len = 0;
 	char tmp[32];
 	bool done = false;
 	int n;
@@ -463,8 +464,27 @@ int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 	while (!done) {
 		int retries = 15;
 
+		/*
+		 * Accumulate data until we have a complete Sahara packet.
+		 * On USB each read returns exactly one packet.  On COM
+		 * port (serial stream) reads can return partial packets
+		 * or multiple packets concatenated together.
+		 */
 		do {
-			n = qdl_read(qdl, buf, sizeof(buf), SAHARA_CMD_TIMEOUT_MS);
+			if (buf_len >= 8) {
+				pkt = (struct sahara_pkt *)buf;
+				if (buf_len >= pkt->length)
+					break;
+			}
+
+			n = qdl_read(qdl, buf + buf_len,
+				     sizeof(buf) - buf_len,
+				     SAHARA_CMD_TIMEOUT_MS);
+			if (n > 0) {
+				buf_len += n;
+				continue;
+			}
+
 			/*
 			 * On COM port transport (Windows QDLoader/PCIe),
 			 * the initial Sahara hello may have been lost if
@@ -472,19 +492,20 @@ int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 			 * periodic reset commands to make the device
 			 * resend it.
 			 */
-			if (n < 0 && !done && retries % 3 == 0)
+			if (!done && retries % 3 == 0)
 				sahara_send_reset(qdl);
-		} while (n < 0 && --retries > 0);
+		} while (--retries > 0);
 
-		if (n < 0) {
+		if (buf_len < 8) {
 			ux_err("failed to read sahara request from device\n");
 			break;
 		}
 
 		pkt = (struct sahara_pkt *)buf;
-		if ((uint32_t)n != pkt->length) {
-			ux_err("request length not matching received request\n");
-			return -EINVAL;
+		if (buf_len < pkt->length) {
+			ux_err("incomplete sahara packet (%zu of %u bytes)\n",
+			       buf_len, pkt->length);
+			break;
 		}
 
 		switch (pkt->cmd) {
@@ -517,8 +538,16 @@ int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 			break;
 		default:
 			sprintf(tmp, "CMD%x", pkt->cmd);
-			print_hex_dump(tmp, buf, n);
+			print_hex_dump(tmp, buf, pkt->length);
 			break;
+		}
+
+		/* Remove consumed packet, keep any trailing data */
+		if (buf_len > pkt->length) {
+			buf_len -= pkt->length;
+			memmove(buf, buf + pkt->length, buf_len);
+		} else {
+			buf_len = 0;
 		}
 	}
 
