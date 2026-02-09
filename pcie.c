@@ -540,11 +540,14 @@ static int pcie_open_win(struct qdl_device *qdl, const char *serial)
 	}
 
 	/*
-	 * Set large receive/transmit buffers to prevent data loss.
-	 * The default 4KB receive buffer can overflow when the device
-	 * sends raw data at USB speed between our polling reads.
+	 * Request a large receive buffer to prevent data loss during
+	 * rawmode reads.  The programmer sends data continuously
+	 * without flow control; if the application can't drain the
+	 * driver buffer fast enough (e.g. during a disk-write gap),
+	 * excess data is silently dropped.  4 MB gives headroom for
+	 * scheduling jitter on top of the 1 MB application buffer.
 	 */
-	SetupComm(hSerial, 1048576, 1048576);
+	SetupComm(hSerial, 4 * 1024 * 1024, 1048576);
 
 	dcb.DCBlength = sizeof(dcb);
 	if (!GetCommState(hSerial, &dcb)) {

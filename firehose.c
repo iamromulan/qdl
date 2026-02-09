@@ -776,6 +776,7 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 {
 	unsigned int sector_size;
 	size_t chunk_size;
+	size_t buf_size;
 	size_t out_offset = 0;
 	xmlNode *root;
 	xmlNode *node;
@@ -787,7 +788,20 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 	int ret;
 	int n;
 
-	buf = malloc(qdl->max_payload_size);
+	/*
+	 * Use a large accumulation buffer to minimise disk-write
+	 * frequency during rawmode.  On serial transports (Windows
+	 * COM port), each write(fd) creates a brief gap during which
+	 * the driver's receive buffer accumulates incoming data.
+	 * With NAND's 16 KB max_payload_size a 120 MB partition
+	 * needs ~7 700 writes, and the cumulative gaps can overflow
+	 * the COM port buffer.  A 1 MB floor reduces that to ~120.
+	 */
+	buf_size = qdl->max_payload_size;
+	if (buf_size < 1024 * 1024)
+		buf_size = 1024 * 1024;
+
+	buf = malloc(buf_size);
 	if (!buf)
 		err(1, "failed to allocate sector buffer");
 
@@ -830,7 +844,7 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 		size_t wanted;
 		size_t got;
 
-		chunk_size = MIN(qdl->max_payload_size / sector_size, left);
+		chunk_size = MIN(buf_size / sector_size, left);
 		wanted = chunk_size * sector_size;
 
 		/*
@@ -850,6 +864,14 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 				       n,
 				       100.0 * (read_op->num_sectors - left) / read_op->num_sectors,
 				       read_op->filename ? read_op->filename : "?");
+				/*
+				 * Write whatever we received before the
+				 * error so the output file is as complete
+				 * as possible (better to lose a few bytes
+				 * at the end than an entire chunk).
+				 */
+				if (got > 0 && fd >= 0)
+					(void)write(fd, buf, got);
 				ret = -1;
 				goto drain;
 			}
@@ -857,6 +879,8 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 				ux_err("unexpected EOF at %.1f%% of %s\n",
 				       100.0 * (read_op->num_sectors - left) / read_op->num_sectors,
 				       read_op->filename ? read_op->filename : "?");
+				if (got > 0 && fd >= 0)
+					(void)write(fd, buf, got);
 				ret = -1;
 				goto drain;
 			}
@@ -896,8 +920,7 @@ drain:
 		int drain_n;
 
 		do {
-			drain_n = qdl_read(qdl, buf,
-					   qdl->max_payload_size, 2000);
+			drain_n = qdl_read(qdl, buf, buf_size, 2000);
 		} while (drain_n > 0);
 	}
 
