@@ -571,14 +571,15 @@ static int pcie_open_win(struct qdl_device *qdl, const char *serial)
 	}
 
 	/*
-	 * Default timeouts — pcie_read_win() overrides per-call
-	 * using the MAXDWORD/MAXDWORD/timeout special case for
-	 * blocking reads.  Set a 5s default here for any reads
-	 * that occur before pcie_read_win() has a chance to adjust.
+	 * Use non-blocking reads (return immediately with available
+	 * data).  Some USB serial drivers (e.g. Qualcomm QDLoader 9008
+	 * and QCMHI) do not correctly implement the MAXDWORD/MAXDWORD
+	 * blocking mode — ReadFile returns EIO or stalls indefinitely.
+	 * Timeouts are enforced in pcie_read_win() via a polling loop.
 	 */
 	timeouts.ReadIntervalTimeout = MAXDWORD;
-	timeouts.ReadTotalTimeoutMultiplier = MAXDWORD;
-	timeouts.ReadTotalTimeoutConstant = 5000;
+	timeouts.ReadTotalTimeoutMultiplier = 0;
+	timeouts.ReadTotalTimeoutConstant = 0;
 	timeouts.WriteTotalTimeoutConstant = 5000;
 	timeouts.WriteTotalTimeoutMultiplier = 0;
 
@@ -602,37 +603,30 @@ static int pcie_read_win(struct qdl_device *qdl, void *buf, size_t len,
 			 unsigned int timeout)
 {
 	struct qdl_device_pcie_win *pcie;
-	COMMTIMEOUTS ct = {0};
+	DWORD deadline;
 	DWORD n = 0;
 
 	pcie = container_of(qdl, struct qdl_device_pcie_win, base);
+	deadline = GetTickCount() + (timeout ? timeout : 5000);
 
 	/*
-	 * Use the MAXDWORD/MAXDWORD/timeout special case (MSDN):
-	 *
-	 *  1. If data is already in the receive buffer, ReadFile
-	 *     returns immediately with all available bytes.
-	 *  2. If the buffer is empty, ReadFile blocks up to
-	 *     ReadTotalTimeoutConstant ms for the first byte.
-	 *  3. Once any byte arrives, ReadFile returns immediately
-	 *     with all available data (no inter-character wait).
-	 *
-	 * This replaces the previous Sleep(10) polling loop, which
-	 * left gaps where the COM port receive buffer could overflow
-	 * during sustained raw-mode data transfers from NAND reads.
+	 * Poll with non-blocking ReadFile until data arrives or
+	 * the timeout expires.  COMMTIMEOUTS is configured for
+	 * immediate return so this works even with drivers that
+	 * do not correctly implement blocking timeout modes
+	 * (e.g. Qualcomm QCMHI, QDLoader 9008).
 	 */
-	ct.ReadIntervalTimeout = MAXDWORD;
-	ct.ReadTotalTimeoutMultiplier = MAXDWORD;
-	ct.ReadTotalTimeoutConstant = timeout ? timeout : 5000;
-	SetCommTimeouts(pcie->hSerial, &ct);
+	do {
+		if (!ReadFile(pcie->hSerial, buf, (DWORD)len, &n, NULL))
+			return -EIO;
 
-	if (!ReadFile(pcie->hSerial, buf, (DWORD)len, &n, NULL))
-		return -EIO;
+		if (n > 0)
+			return (int)n;
 
-	if (n == 0)
-		return -ETIMEDOUT;
+		Sleep(10);
+	} while (GetTickCount() < deadline);
 
-	return (int)n;
+	return -ETIMEDOUT;
 }
 
 static int pcie_write_win(struct qdl_device *qdl, const void *buf, size_t len,
