@@ -42,7 +42,14 @@ the original QDL:
   (e.g. `--serial COM49`) to target a specific modem when multiple are connected.
 - **MD5 Verification** - Verifies firmware file integrity before flashing when MD5
   checksums are present in the XML (can be skipped with `--skip-md5`)
-- **Improved NAND Support** - Fixes for NAND device flashing (last_sector handling)
+- **Partition Backup** - Read individual partitions by label (`read`) or dump all
+  at once (`readall`). Supports full-storage single-file dumps for complete
+  backup/restore via `--single-file`. Auto-detects file extensions from partition
+  content (`.elf`, `.ubi`, `.img`, etc.). Automatic retry on read failures.
+- **XML Generation** - `printgpt --make-xml=read` and `--make-xml=program` generate
+  rawread/rawprogram XML files from the live partition layout.
+- **Improved NAND Support** - Fixes for NAND device flashing (last_sector handling),
+  MIBIB/SMEM partition table support for backup and inspection.
 - **Relaxed XML Parsing** - Optional attributes (label, sparse) no longer cause failures
 - **Single Binary** - All tools consolidated into one `qfenix` binary with subcommands
 
@@ -78,6 +85,7 @@ qfenix prog_firehose_ddr.elf rawprogram*.xml patch*.xml
 | `reset` | Reset/power-off/EDL-reboot a device |
 | `getslot` | Show the active A/B slot |
 | `setslot` | Set the active A/B slot |
+| `read` | Read a single partition by label |
 | `readall` | Dump all partitions to files |
 | `nvread` | Read an NV item via DIAG |
 | `nvwrite` | Write an NV item via DIAG |
@@ -192,6 +200,10 @@ Inspect partition tables and A/B slot status on a live device in EDL mode:
 # Print GPT partition tables
 qfenix printgpt prog_firehose_ddr.elf
 
+# Generate rawread/rawprogram XML files from the partition layout
+qfenix printgpt -L /path/to/firmware/ --make-xml=read -o ./backup/
+qfenix printgpt -L /path/to/firmware/ --make-xml=program -o ./backup/
+
 # Get active A/B slot
 qfenix getslot prog_firehose_ddr.elf
 
@@ -203,6 +215,18 @@ qfenix storageinfo prog_firehose_ddr.elf
 
 # Dump all partitions to a directory
 qfenix readall prog_firehose_ddr.elf -o /path/to/output/
+
+# Or use auto-detected loader
+qfenix readall -L /path/to/firmware/ -o /path/to/output/
+
+# Dump entire storage as a single file (for full backup/restore)
+qfenix readall -L /path/to/firmware/ --single-file=/path/to/full_backup.bin
+
+# Read a single partition by label
+qfenix read efs2 -L /path/to/firmware/ -o /path/to/efs2_backup.bin
+
+# If -o is omitted, output goes to the loader directory
+qfenix read modem -L /path/to/firmware/
 ```
 
 ### PCIe modem flashing

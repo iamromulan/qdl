@@ -743,6 +743,7 @@ static void print_usage(FILE *out)
 	fprintf(out, "  reset         Reset, power-off, or EDL-reboot a device\n");
 	fprintf(out, "  getslot       Show the active A/B slot\n");
 	fprintf(out, "  setslot       Set the active A/B slot (a or b)\n");
+	fprintf(out, "  read          Read a single partition by label\n");
 	fprintf(out, "  readall       Dump all partitions to files\n");
 	fprintf(out, "  nvread        Read an NV item via DIAG\n");
 	fprintf(out, "  nvwrite       Write an NV item via DIAG\n");
@@ -2090,16 +2091,18 @@ static int qdl_setslot(int argc, char **argv)
 	return !!ret;
 }
 
-static int qdl_readall(int argc, char **argv)
+static int qdl_read_partition(int argc, char **argv)
 {
 	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
 	struct qdl_device *qdl = NULL;
-	const char *outdir = ".";
+	const char *outfile = NULL;
 	char *loader_dir = NULL;
 	char *programmer = NULL;
+	const char *label;
 	bool storage_set = false;
 	bool use_pcie = false;
 	char *serial = NULL;
+	char auto_path[4096];
 	int opt;
 	int ret;
 
@@ -2131,7 +2134,7 @@ static int qdl_readall(int argc, char **argv)
 			storage_set = true;
 			break;
 		case 'o':
-			outdir = optarg;
+			outfile = optarg;
 			break;
 		case 'L':
 			loader_dir = optarg;
@@ -2141,7 +2144,112 @@ static int qdl_readall(int argc, char **argv)
 			break;
 		case 'h':
 		default:
-			fprintf(stderr, "Usage: qfenix readall [-L dir | <programmer>] [-o outdir] [--serial=S] [--storage=T] [--pcie]\n");
+			fprintf(stderr,
+				"Usage: qfenix read <label> [-L dir | <programmer>] [-o output] [--serial=S] [--storage=T] [--pcie]\n"
+				"\nRead a single partition by label.\n"
+				"If -o is omitted, output to the loader directory (or current directory).\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (optind >= argc) {
+		fprintf(stderr, "Error: partition label required\n");
+		return 1;
+	}
+	label = argv[optind++];
+
+	if (loader_dir) {
+		programmer = find_programmer_recursive(loader_dir);
+		if (!programmer) {
+			fprintf(stderr, "Error: no programmer found in %s\n", loader_dir);
+			return 1;
+		}
+		if (!storage_set)
+			storage_type = detect_storage_from_directory(loader_dir);
+	} else if (optind >= argc) {
+		fprintf(stderr, "Error: programmer file or -L <dir> required\n");
+		return 1;
+	}
+
+	if (!outfile) {
+		const char *dir = loader_dir ? loader_dir : ".";
+		snprintf(auto_path, sizeof(auto_path), "%s/%s.bin", dir, label);
+		outfile = auto_path;
+	}
+
+	ret = firehose_session_open(&qdl, programmer ? programmer : argv[optind],
+				    storage_type, serial, use_pcie);
+	if (ret) {
+		free(programmer);
+		return 1;
+	}
+
+	ret = gpt_read_partition(qdl, label, outfile);
+
+	firehose_session_close(qdl, true);
+	free(programmer);
+	return !!ret;
+}
+
+static int qdl_readall(int argc, char **argv)
+{
+	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
+	struct qdl_device *qdl = NULL;
+	const char *outdir = ".";
+	const char *single_file = NULL;
+	char *loader_dir = NULL;
+	char *programmer = NULL;
+	bool storage_set = false;
+	bool use_pcie = false;
+	char *serial = NULL;
+	int opt;
+	int ret;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"storage", required_argument, 0, 's'},
+		{"output", required_argument, 0, 'o'},
+		{"find-loader", required_argument, 0, 'L'},
+		{"pcie", no_argument, 0, 'P'},
+		{"single-file", required_argument, 0, 'F'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:s:o:L:Ph", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 's':
+			storage_type = decode_storage(optarg);
+			storage_set = true;
+			break;
+		case 'o':
+			outdir = optarg;
+			break;
+		case 'L':
+			loader_dir = optarg;
+			break;
+		case 'P':
+			use_pcie = true;
+			break;
+		case 'F':
+			single_file = optarg;
+			break;
+		case 'h':
+		default:
+			fprintf(stderr,
+				"Usage: qfenix readall [-L dir | <programmer>] [-o outdir] [--single-file=FILE] [--serial=S] [--storage=T] [--pcie]\n"
+				"\n  --single-file=FILE  Dump entire storage as one file (for full restore)\n");
 			return opt == 'h' ? 0 : 1;
 		}
 	}
@@ -2166,7 +2274,10 @@ static int qdl_readall(int argc, char **argv)
 		return 1;
 	}
 
-	ret = gpt_read_all_partitions(qdl, outdir);
+	if (single_file)
+		ret = gpt_read_full_storage(qdl, single_file);
+	else
+		ret = gpt_read_all_partitions(qdl, outdir);
 
 	firehose_session_close(qdl, true);
 	free(programmer);
@@ -2888,6 +2999,8 @@ int main(int argc, char **argv)
 		return qdl_getslot(argc - 1, argv + 1);
 	if (argc >= 2 && !strcmp(argv[1], "setslot"))
 		return qdl_setslot(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "read"))
+		return qdl_read_partition(argc - 1, argv + 1);
 	if (argc >= 2 && !strcmp(argv[1], "readall"))
 		return qdl_readall(argc - 1, argv + 1);
 	if (argc >= 2 && !strcmp(argv[1], "nvread"))
