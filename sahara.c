@@ -461,7 +461,12 @@ int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 		return 0;
 
 	while (!done) {
-		n = qdl_read(qdl, buf, sizeof(buf), SAHARA_CMD_TIMEOUT_MS);
+		int retries = 5;
+
+		do {
+			n = qdl_read(qdl, buf, sizeof(buf), SAHARA_CMD_TIMEOUT_MS);
+		} while (n < 0 && --retries > 0);
+
 		if (n < 0) {
 			ux_err("failed to read sahara request from device\n");
 			break;
