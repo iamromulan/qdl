@@ -1,8 +1,6 @@
 *.1
 *.o
 qfenix
-qfenix-ramdump
-qfenix-ks
 *.exe
 compile_commands.json
 .cache

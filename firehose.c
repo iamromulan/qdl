@@ -929,7 +929,7 @@ static int firehose_set_bootable(struct qdl_device *qdl, int part)
 	return 0;
 }
 
-static int firehose_reset(struct qdl_device *qdl)
+int firehose_power(struct qdl_device *qdl, const char *mode, int delay)
 {
 	xmlNode *root;
 	xmlNode *node;
@@ -941,8 +941,8 @@ static int firehose_reset(struct qdl_device *qdl)
 	xmlDocSetRootElement(doc, root);
 
 	node = xmlNewChild(root, NULL, (xmlChar *)"power", NULL);
-	xml_setpropf(node, "value", "reset");
-	xml_setpropf(node, "DelayInSeconds", "10"); // Add a delay to prevent reboot fail
+	xml_setpropf(node, "value", "%s", mode);
+	xml_setpropf(node, "DelayInSeconds", "%d", delay);
 
 	ret = firehose_write(qdl, doc);
 	xmlFreeDoc(doc);
@@ -951,18 +951,23 @@ static int firehose_reset(struct qdl_device *qdl)
 
 	ret = firehose_read(qdl, 5000, firehose_generic_parser, NULL);
 	if (ret < 0)
-		ux_err("failed to request device reset\n");
-	/* drain any remaining log messages for reset */
+		ux_err("failed to send power command '%s'\n", mode);
+	/* drain any remaining log messages */
 	else
 		firehose_read(qdl, 1000, firehose_generic_parser, NULL);
 
 	return ret == FIREHOSE_ACK ? 0 : -1;
 }
 
-static int firehose_detect_and_configure(struct qdl_device *qdl,
-					 bool skip_storage_init,
-					 enum qdl_storage_type storage,
-					 unsigned int timeout_s)
+static int firehose_reset(struct qdl_device *qdl)
+{
+	return firehose_power(qdl, "reset", 10);
+}
+
+int firehose_detect_and_configure(struct qdl_device *qdl,
+				  bool skip_storage_init,
+				  enum qdl_storage_type storage,
+				  unsigned int timeout_s)
 {
 	struct timeval timeout = { .tv_sec = timeout_s };
 	struct timeval now;
@@ -1051,4 +1056,107 @@ int firehose_run(struct qdl_device *qdl)
 	firehose_reset(qdl);
 
 	return 0;
+}
+
+static int firehose_getstorageinfo_parser(xmlNode *node, void *data,
+					  bool *rawmode __unused)
+{
+	struct storage_info *info = data;
+	xmlChar *value;
+	int ret = -EINVAL;
+	char *text;
+	char *eq;
+
+	value = xmlGetProp(node, (xmlChar *)"value");
+	if (!value)
+		return -EINVAL;
+
+	text = (char *)value;
+
+	if (xmlStrcmp(node->name, (xmlChar *)"log") == 0) {
+		ux_log("LOG: %s\n", text);
+
+		if ((eq = strstr(text, "total_blocks=")))
+			info->total_blocks = strtoul(eq + 13, NULL, 0);
+		if ((eq = strstr(text, "block_size=")))
+			info->block_size = strtoul(eq + 11, NULL, 0);
+		if ((eq = strstr(text, "page_size=")))
+			info->page_size = strtoul(eq + 10, NULL, 0);
+		if ((eq = strstr(text, "num_physical_partitions=")))
+			info->num_physical = strtoul(eq + 24, NULL, 0);
+		if ((eq = strstr(text, "SECTOR_SIZE_IN_BYTES=")))
+			info->sector_size = strtoul(eq + 21, NULL, 0);
+		if ((eq = strstr(text, "mem_type=")))
+			snprintf(info->mem_type, sizeof(info->mem_type),
+				 "%s", eq + 9);
+		if ((eq = strstr(text, "prod_name=")))
+			snprintf(info->prod_name, sizeof(info->prod_name),
+				 "%s", eq + 10);
+
+		ret = -EAGAIN;
+	} else if (xmlStrcmp(value, (xmlChar *)"ACK") == 0) {
+		ret = FIREHOSE_ACK;
+	} else if (xmlStrcmp(value, (xmlChar *)"NAK") == 0) {
+		ret = FIREHOSE_NAK;
+	}
+
+	xmlFree(value);
+	return ret;
+}
+
+int firehose_getstorageinfo(struct qdl_device *qdl,
+			    unsigned int phys_partition,
+			    struct storage_info *info)
+{
+	xmlNode *root;
+	xmlNode *node;
+	xmlDoc *doc;
+	int ret;
+
+	memset(info, 0, sizeof(*info));
+
+	doc = xmlNewDoc((xmlChar *)"1.0");
+	root = xmlNewNode(NULL, (xmlChar *)"data");
+	xmlDocSetRootElement(doc, root);
+
+	node = xmlNewChild(root, NULL, (xmlChar *)"getstorageinfo", NULL);
+	xml_setpropf(node, "physical_partition_number", "%d", phys_partition);
+
+	ret = firehose_write(qdl, doc);
+	xmlFreeDoc(doc);
+	if (ret < 0)
+		return -1;
+
+	ret = firehose_read(qdl, 10000, firehose_getstorageinfo_parser, info);
+	return ret == FIREHOSE_ACK ? 0 : -1;
+}
+
+int firehose_read_to_file(struct qdl_device *qdl, unsigned int partition,
+			  unsigned int start_sector, unsigned int num_sectors,
+			  unsigned int sector_size, const char *filename)
+{
+	struct read_op op;
+	char start_str[32];
+	int fd;
+	int ret;
+
+	snprintf(start_str, sizeof(start_str), "%u", start_sector);
+
+	memset(&op, 0, sizeof(op));
+	op.sector_size = sector_size;
+	op.start_sector = start_str;
+	op.num_sectors = num_sectors;
+	op.partition = partition;
+	op.filename = filename;
+
+	fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0) {
+		ux_err("failed to open %s for writing: %s\n",
+		       filename, strerror(errno));
+		return -1;
+	}
+
+	ret = firehose_issue_read(qdl, &op, fd, NULL, 0, false);
+	close(fd);
+	return ret;
 }
