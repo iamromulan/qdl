@@ -564,6 +564,40 @@ static enum qdl_storage_type detect_storage_from_filename(const char *filename)
 	return QDL_STORAGE_UFS; /* default */
 }
 
+/*
+ * Recursively search a directory for a Firehose programmer file.
+ * Tries multiple known naming patterns in priority order.
+ * Returns malloc'd path on success, NULL on failure.
+ */
+static char *find_programmer_recursive(const char *base_dir)
+{
+	static const struct {
+		const char *prefix;
+		const char *suffix;
+	} patterns[] = {
+		{ "prog_firehose_",      ".elf"  },
+		{ "prog_firehose_",      ".mbn"  },
+		{ "prog_nand_firehose_", ".mbn"  },
+		{ "prog_emmc_firehose_", ".mbn"  },
+		{ "prog_ufs_firehose_",  ".mbn"  },
+		{ "firehose-prog",       ".mbn"  },
+		{ "prog_",               ".mbn"  },
+		{ "prog_",               ".elf"  },
+		{ "xbl_s_devprg_",       ".melf" },
+	};
+	char *result;
+	size_t i;
+
+	for (i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++) {
+		result = find_file_recursive(base_dir, patterns[i].prefix,
+					     patterns[i].suffix);
+		if (result)
+			return result;
+	}
+
+	return NULL;
+}
+
 static int firmware_detect(const char *base_dir, struct firmware_files *fw)
 {
 	char *dir_buf;
@@ -573,23 +607,7 @@ static int firmware_detect(const char *base_dir, struct firmware_files *fw)
 	fw->storage_type = QDL_STORAGE_UFS;
 
 	/* Find programmer file by searching recursively from base directory */
-	fw->programmer = find_file_recursive(base_dir, "prog_firehose_", ".elf");
-	if (!fw->programmer)
-		fw->programmer = find_file_recursive(base_dir, "prog_firehose_", ".mbn");
-	if (!fw->programmer)
-		fw->programmer = find_file_recursive(base_dir, "prog_nand_firehose_", ".mbn");
-	if (!fw->programmer)
-		fw->programmer = find_file_recursive(base_dir, "prog_emmc_firehose_", ".mbn");
-	if (!fw->programmer)
-		fw->programmer = find_file_recursive(base_dir, "prog_ufs_firehose_", ".mbn");
-	if (!fw->programmer)
-		fw->programmer = find_file_recursive(base_dir, "firehose-prog", ".mbn");
-	if (!fw->programmer)
-		fw->programmer = find_file_recursive(base_dir, "prog_", ".mbn");
-	if (!fw->programmer)
-		fw->programmer = find_file_recursive(base_dir, "prog_", ".elf");
-	if (!fw->programmer)
-		fw->programmer = find_file_recursive(base_dir, "xbl_s_devprg_", ".melf");
+	fw->programmer = find_programmer_recursive(base_dir);
 
 	if (!fw->programmer) {
 		ux_err("no programmer file found under %s\n", base_dir);
@@ -670,48 +688,56 @@ static void print_usage(FILE *out)
 {
 	extern const char *__progname;
 
-	fprintf(out, "qfenix\n");
-	fprintf(out, "A qdl fork that aims to add more features, by iamromulan.\n");
+	fprintf(out, "qfenix - Qualcomm Firehose / DIAG multi-tool\n");
 #ifdef BUILD_STATIC
 	fprintf(out, "qfenix %s, %s %s, static binary\n\n", VERSION, __DATE__, __TIME__);
 #else
 	fprintf(out, "qfenix %s, %s %s, dynamically linked\n\n", VERSION, __DATE__, __TIME__);
 #endif
-	fprintf(out, "Usage: %s [options] <prog.mbn> (<program-xml> | <patch-xml> | <read-xml>)...\n", __progname);
+	fprintf(out, "Usage: %s [options] <prog.mbn> <program-xml|patch-xml|read-xml>...\n", __progname);
 	fprintf(out, "       %s [options] -F <firmware-dir>\n", __progname);
-	fprintf(out, "       %s [options] <prog.mbn> ((read | write) <address> <binary>)...\n", __progname);
-	fprintf(out, "       %s list\n", __progname);
-	fprintf(out, "       %s ramdump [--debug] [-o <ramdump-path>] [<segment-filter>,...]\n", __progname);
-	fprintf(out, "       %s ks -p <device-node> -s <id:file> [-s <id:file>]...\n", __progname);
-	fprintf(out, "       %s diag2edl [--debug] [--serial=<serial>]\n", __progname);
-	fprintf(out, "\nOptions:\n");
-	fprintf(out, " -d, --debug\t\t\tPrint detailed debug info\n");
-	fprintf(out, " -v, --version\t\t\tPrint the current version and exit\n");
-	fprintf(out, " -n, --dry-run\t\t\tDry run execution, no device reading or flashing\n");
-	fprintf(out, " -f, --allow-missing\t\tAllow skipping of missing files during flashing\n");
-	fprintf(out, " -s, --storage=T\t\tSet target storage type T: <emmc|nand|nvme|spinor|ufs>\n");
-	fprintf(out, " -l, --finalize-provisioning\tProvision the target storage\n");
-	fprintf(out, " -i, --include=T\t\tSet an optional folder T to search for files\n");
-	fprintf(out, " -S, --serial=T\t\t\tSelect target by serial number T (e.g. <0AA94EFD>)\n");
-	fprintf(out, " -u, --out-chunk-size=T\t\tOverride chunk size for transaction with T\n");
-	fprintf(out, " -t, --create-digests=T\t\tGenerate table of digests in the T folder\n");
-	fprintf(out, " -T, --slot=T\t\t\tSet slot number T for multiple storage devices\n");
-	fprintf(out, " -D, --vip-table-path=T\t\tUse digest tables in the T folder for VIP\n");
-	fprintf(out, " -E, --no-auto-edl\t\tDisable automatic DIAG to EDL mode switching\n");
-	fprintf(out, " -M, --skip-md5\t\t\tSkip MD5 verification of firmware files\n");
-	fprintf(out, " -F, --firmware-dir=T\t\tAuto-detect and load firmware from directory T\n");
-	fprintf(out, " -P, --pcie\t\t\tUse PCIe/MHI transport instead of USB\n");
-	fprintf(out, " -h, --help\t\t\tPrint this usage info\n");
-	fprintf(out, "\nArguments:\n");
-	fprintf(out, " <program-xml>\t\txml file containing <program> or <erase> directives\n");
-	fprintf(out, " <patch-xml>\t\txml file containing <patch> directives\n");
-	fprintf(out, " <read-xml>\t\txml file containing <read> directives\n");
-	fprintf(out, " <address>\t\tdisk address specifier, can be one of <P>, <P/S>, <P/S+L>, <name>, or\n");
-	fprintf(out, "          \t\t<P/name>, to specify a physical partition number P, a starting sector\n");
-	fprintf(out, "          \t\tnumber S, the number of sectors to follow L, or partition by \"name\"\n");
-	fprintf(out, " <ramdump-path>\t\tpath where ramdump should stored\n");
-	fprintf(out, " <segment-filter>\toptional glob-pattern to select which segments to ramdump\n");
-	fprintf(out, "\nExample: %s prog_firehose_ddr.elf rawprogram*.xml patch*.xml\n", __progname);
+	fprintf(out, "       %s [options] <prog.mbn> (read|write) <address> <binary>...\n", __progname);
+	fprintf(out, "\nSubcommands:\n");
+	fprintf(out, "  list          List connected EDL, DIAG, and PCIe devices\n");
+	fprintf(out, "  diag2edl      Switch a device from DIAG to EDL mode\n");
+	fprintf(out, "  printgpt      Print GPT partition tables\n");
+	fprintf(out, "  storageinfo   Query storage hardware information\n");
+	fprintf(out, "  reset         Reset, power-off, or EDL-reboot a device\n");
+	fprintf(out, "  getslot       Show the active A/B slot\n");
+	fprintf(out, "  setslot       Set the active A/B slot (a or b)\n");
+	fprintf(out, "  readall       Dump all partitions to files\n");
+	fprintf(out, "  nvread        Read an NV item via DIAG\n");
+	fprintf(out, "  nvwrite       Write an NV item via DIAG\n");
+	fprintf(out, "  efsls         List an EFS directory via DIAG\n");
+	fprintf(out, "  efsget        Download a file from EFS via DIAG\n");
+	fprintf(out, "  efsdump       Dump the EFS factory image via DIAG\n");
+	fprintf(out, "  ramdump       Extract RAM dumps via Sahara\n");
+	fprintf(out, "  ks            Keystore/Sahara over serial device nodes\n");
+	fprintf(out, "\nUse '%s <subcommand> --help' for detailed subcommand usage.\n", __progname);
+	fprintf(out, "\nFlash options:\n");
+	fprintf(out, "  -d, --debug               Print detailed debug info\n");
+	fprintf(out, "  -n, --dry-run             Dry run, no device reading or flashing\n");
+	fprintf(out, "  -f, --allow-missing       Allow skipping of missing files\n");
+	fprintf(out, "  -s, --storage=T           Set storage type: emmc|nand|nvme|spinor|ufs (default: ufs)\n");
+	fprintf(out, "  -l, --finalize-provisioning  Provision the target storage\n");
+	fprintf(out, "  -i, --include=T           Set folder T to search for files\n");
+	fprintf(out, "  -S, --serial=T            Target by serial number or COM port name\n");
+	fprintf(out, "  -u, --out-chunk-size=T    Override chunk size for transactions\n");
+	fprintf(out, "  -t, --create-digests=T    Generate VIP digest table in folder T\n");
+	fprintf(out, "  -T, --slot=T              Set slot number for multiple storage devices\n");
+	fprintf(out, "  -D, --vip-table-path=T    Use VIP digest tables from folder T\n");
+	fprintf(out, "  -E, --no-auto-edl         Disable automatic DIAG to EDL switching\n");
+	fprintf(out, "  -M, --skip-md5            Skip MD5 verification of firmware files\n");
+	fprintf(out, "  -F, --firmware-dir=T      Auto-detect firmware from directory T\n");
+	fprintf(out, "  -L, --find-loader=T       Auto-detect programmer/loader from directory T\n");
+	fprintf(out, "  -P, --pcie                Use PCIe/MHI transport instead of USB\n");
+	fprintf(out, "  -v, --version             Print version and exit\n");
+	fprintf(out, "  -h, --help                Print this usage info\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s -F /path/to/firmware/          Auto-detect and flash\n", __progname);
+	fprintf(out, "  %s prog_firehose_ddr.elf rawprogram*.xml patch*.xml\n", __progname);
+	fprintf(out, "  %s printgpt -L /path/to/firmware/ Print GPT from auto-detected loader\n", __progname);
+	fprintf(out, "  %s list                           List connected devices\n", __progname);
 }
 
 /*
@@ -1542,6 +1568,8 @@ static int qdl_printgpt(int argc, char **argv)
 {
 	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
 	struct qdl_device *qdl = NULL;
+	char *loader_dir = NULL;
+	char *programmer = NULL;
 	bool use_pcie = false;
 	char *serial = NULL;
 	int opt;
@@ -1552,12 +1580,13 @@ static int qdl_printgpt(int argc, char **argv)
 		{"version", no_argument, 0, 'v'},
 		{"serial", required_argument, 0, 'S'},
 		{"storage", required_argument, 0, 's'},
+		{"find-loader", required_argument, 0, 'L'},
 		{"pcie", no_argument, 0, 'P'},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
 
-	while ((opt = getopt_long(argc, argv, "dvS:s:Ph", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "dvS:s:L:Ph", options, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			qdl_debug = true;
@@ -1571,30 +1600,42 @@ static int qdl_printgpt(int argc, char **argv)
 		case 's':
 			storage_type = decode_storage(optarg);
 			break;
+		case 'L':
+			loader_dir = optarg;
+			break;
 		case 'P':
 			use_pcie = true;
 			break;
 		case 'h':
 		default:
-			fprintf(stderr, "Usage: qfenix printgpt <programmer> [--debug] [--serial=S] [--storage=T] [--pcie]\n");
+			fprintf(stderr, "Usage: qfenix printgpt [-L dir | <programmer>] [--serial=S] [--storage=T] [--pcie]\n");
 			return opt == 'h' ? 0 : 1;
 		}
 	}
 
-	if (optind >= argc) {
-		fprintf(stderr, "Error: programmer file required\n");
-		fprintf(stderr, "Usage: qfenix printgpt <programmer> [--debug] [--serial=S] [--storage=T] [--pcie]\n");
+	if (loader_dir) {
+		programmer = find_programmer_recursive(loader_dir);
+		if (!programmer) {
+			fprintf(stderr, "Error: no programmer found in %s\n", loader_dir);
+			return 1;
+		}
+	} else if (optind >= argc) {
+		fprintf(stderr, "Error: programmer file or -L <dir> required\n");
+		fprintf(stderr, "Usage: qfenix printgpt [-L dir | <programmer>] [--serial=S] [--storage=T] [--pcie]\n");
 		return 1;
 	}
 
-	ret = firehose_session_open(&qdl, argv[optind], storage_type, serial,
-				    use_pcie);
-	if (ret)
+	ret = firehose_session_open(&qdl, programmer ? programmer : argv[optind],
+				    storage_type, serial, use_pcie);
+	if (ret) {
+		free(programmer);
 		return 1;
+	}
 
 	ret = gpt_print_table(qdl);
 
 	firehose_session_close(qdl, false);
+	free(programmer);
 	return !!ret;
 }
 
@@ -1603,6 +1644,8 @@ static int qdl_storageinfo(int argc, char **argv)
 	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
 	struct storage_info info;
 	struct qdl_device *qdl = NULL;
+	char *loader_dir = NULL;
+	char *programmer = NULL;
 	bool use_pcie = false;
 	char *serial = NULL;
 	int opt;
@@ -1613,12 +1656,13 @@ static int qdl_storageinfo(int argc, char **argv)
 		{"version", no_argument, 0, 'v'},
 		{"serial", required_argument, 0, 'S'},
 		{"storage", required_argument, 0, 's'},
+		{"find-loader", required_argument, 0, 'L'},
 		{"pcie", no_argument, 0, 'P'},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
 
-	while ((opt = getopt_long(argc, argv, "dvS:s:Ph", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "dvS:s:L:Ph", options, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			qdl_debug = true;
@@ -1632,25 +1676,36 @@ static int qdl_storageinfo(int argc, char **argv)
 		case 's':
 			storage_type = decode_storage(optarg);
 			break;
+		case 'L':
+			loader_dir = optarg;
+			break;
 		case 'P':
 			use_pcie = true;
 			break;
 		case 'h':
 		default:
-			fprintf(stderr, "Usage: qfenix storageinfo <programmer> [--debug] [--serial=S] [--storage=T] [--pcie]\n");
+			fprintf(stderr, "Usage: qfenix storageinfo [-L dir | <programmer>] [--serial=S] [--storage=T] [--pcie]\n");
 			return opt == 'h' ? 0 : 1;
 		}
 	}
 
-	if (optind >= argc) {
-		fprintf(stderr, "Error: programmer file required\n");
+	if (loader_dir) {
+		programmer = find_programmer_recursive(loader_dir);
+		if (!programmer) {
+			fprintf(stderr, "Error: no programmer found in %s\n", loader_dir);
+			return 1;
+		}
+	} else if (optind >= argc) {
+		fprintf(stderr, "Error: programmer file or -L <dir> required\n");
 		return 1;
 	}
 
-	ret = firehose_session_open(&qdl, argv[optind], storage_type, serial,
-				    use_pcie);
-	if (ret)
+	ret = firehose_session_open(&qdl, programmer ? programmer : argv[optind],
+				    storage_type, serial, use_pcie);
+	if (ret) {
+		free(programmer);
 		return 1;
+	}
 
 	ret = firehose_getstorageinfo(qdl, 0, &info);
 	if (ret == 0) {
@@ -1674,6 +1729,7 @@ static int qdl_storageinfo(int argc, char **argv)
 	}
 
 	firehose_session_close(qdl, false);
+	free(programmer);
 	return !!ret;
 }
 
@@ -1682,6 +1738,8 @@ static int qdl_reset(int argc, char **argv)
 	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
 	struct qdl_device *qdl = NULL;
 	const char *mode = "reset";
+	char *loader_dir = NULL;
+	char *programmer = NULL;
 	bool use_pcie = false;
 	char *serial = NULL;
 	int opt;
@@ -1693,12 +1751,13 @@ static int qdl_reset(int argc, char **argv)
 		{"serial", required_argument, 0, 'S'},
 		{"storage", required_argument, 0, 's'},
 		{"mode", required_argument, 0, 'm'},
+		{"find-loader", required_argument, 0, 'L'},
 		{"pcie", no_argument, 0, 'P'},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
 
-	while ((opt = getopt_long(argc, argv, "dvS:s:m:Ph", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "dvS:s:m:L:Ph", options, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			qdl_debug = true;
@@ -1715,31 +1774,43 @@ static int qdl_reset(int argc, char **argv)
 		case 'm':
 			mode = optarg;
 			break;
+		case 'L':
+			loader_dir = optarg;
+			break;
 		case 'P':
 			use_pcie = true;
 			break;
 		case 'h':
 		default:
-			fprintf(stderr, "Usage: qfenix reset <programmer> [--mode=reset|off|edl] [--debug] [--serial=S] [--storage=T] [--pcie]\n");
+			fprintf(stderr, "Usage: qfenix reset [-L dir | <programmer>] [--mode=reset|off|edl] [--serial=S] [--storage=T] [--pcie]\n");
 			return opt == 'h' ? 0 : 1;
 		}
 	}
 
-	if (optind >= argc) {
-		fprintf(stderr, "Error: programmer file required\n");
+	if (loader_dir) {
+		programmer = find_programmer_recursive(loader_dir);
+		if (!programmer) {
+			fprintf(stderr, "Error: no programmer found in %s\n", loader_dir);
+			return 1;
+		}
+	} else if (optind >= argc) {
+		fprintf(stderr, "Error: programmer file or -L <dir> required\n");
 		return 1;
 	}
 
-	ret = firehose_session_open(&qdl, argv[optind], storage_type, serial,
-				    use_pcie);
-	if (ret)
+	ret = firehose_session_open(&qdl, programmer ? programmer : argv[optind],
+				    storage_type, serial, use_pcie);
+	if (ret) {
+		free(programmer);
 		return 1;
+	}
 
 	ux_info("sending power command: %s\n", mode);
 	ret = firehose_power(qdl, mode, 1);
 
 	qdl_close(qdl);
 	qdl_deinit(qdl);
+	free(programmer);
 	return !!ret;
 }
 
@@ -1747,6 +1818,8 @@ static int qdl_getslot(int argc, char **argv)
 {
 	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
 	struct qdl_device *qdl = NULL;
+	char *loader_dir = NULL;
+	char *programmer = NULL;
 	bool use_pcie = false;
 	char *serial = NULL;
 	int opt;
@@ -1758,12 +1831,13 @@ static int qdl_getslot(int argc, char **argv)
 		{"version", no_argument, 0, 'v'},
 		{"serial", required_argument, 0, 'S'},
 		{"storage", required_argument, 0, 's'},
+		{"find-loader", required_argument, 0, 'L'},
 		{"pcie", no_argument, 0, 'P'},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
 
-	while ((opt = getopt_long(argc, argv, "dvS:s:Ph", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "dvS:s:L:Ph", options, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			qdl_debug = true;
@@ -1777,25 +1851,36 @@ static int qdl_getslot(int argc, char **argv)
 		case 's':
 			storage_type = decode_storage(optarg);
 			break;
+		case 'L':
+			loader_dir = optarg;
+			break;
 		case 'P':
 			use_pcie = true;
 			break;
 		case 'h':
 		default:
-			fprintf(stderr, "Usage: qfenix getslot <programmer> [--debug] [--serial=S] [--storage=T] [--pcie]\n");
+			fprintf(stderr, "Usage: qfenix getslot [-L dir | <programmer>] [--serial=S] [--storage=T] [--pcie]\n");
 			return opt == 'h' ? 0 : 1;
 		}
 	}
 
-	if (optind >= argc) {
-		fprintf(stderr, "Error: programmer file required\n");
+	if (loader_dir) {
+		programmer = find_programmer_recursive(loader_dir);
+		if (!programmer) {
+			fprintf(stderr, "Error: no programmer found in %s\n", loader_dir);
+			return 1;
+		}
+	} else if (optind >= argc) {
+		fprintf(stderr, "Error: programmer file or -L <dir> required\n");
 		return 1;
 	}
 
-	ret = firehose_session_open(&qdl, argv[optind], storage_type, serial,
-				    use_pcie);
-	if (ret)
+	ret = firehose_session_open(&qdl, programmer ? programmer : argv[optind],
+				    storage_type, serial, use_pcie);
+	if (ret) {
+		free(programmer);
 		return 1;
+	}
 
 	slot = gpt_get_active_slot(qdl);
 	if (slot > 0)
@@ -1804,6 +1889,7 @@ static int qdl_getslot(int argc, char **argv)
 		ux_err("failed to determine active slot\n");
 
 	firehose_session_close(qdl, false);
+	free(programmer);
 	return slot > 0 ? 0 : 1;
 }
 
@@ -1811,6 +1897,8 @@ static int qdl_setslot(int argc, char **argv)
 {
 	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
 	struct qdl_device *qdl = NULL;
+	char *loader_dir = NULL;
+	char *programmer = NULL;
 	bool use_pcie = false;
 	char *serial = NULL;
 	char slot;
@@ -1822,12 +1910,13 @@ static int qdl_setslot(int argc, char **argv)
 		{"version", no_argument, 0, 'v'},
 		{"serial", required_argument, 0, 'S'},
 		{"storage", required_argument, 0, 's'},
+		{"find-loader", required_argument, 0, 'L'},
 		{"pcie", no_argument, 0, 'P'},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
 
-	while ((opt = getopt_long(argc, argv, "dvS:s:Ph", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "dvS:s:L:Ph", options, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			qdl_debug = true;
@@ -1841,12 +1930,15 @@ static int qdl_setslot(int argc, char **argv)
 		case 's':
 			storage_type = decode_storage(optarg);
 			break;
+		case 'L':
+			loader_dir = optarg;
+			break;
 		case 'P':
 			use_pcie = true;
 			break;
 		case 'h':
 		default:
-			fprintf(stderr, "Usage: qfenix setslot <a|b> <programmer> [--debug] [--serial=S] [--storage=T] [--pcie]\n");
+			fprintf(stderr, "Usage: qfenix setslot <a|b> [-L dir | <programmer>] [--serial=S] [--storage=T] [--pcie]\n");
 			return opt == 'h' ? 0 : 1;
 		}
 	}
@@ -1863,21 +1955,30 @@ static int qdl_setslot(int argc, char **argv)
 	}
 	optind++;
 
-	if (optind >= argc) {
-		fprintf(stderr, "Error: programmer file required\n");
+	if (loader_dir) {
+		programmer = find_programmer_recursive(loader_dir);
+		if (!programmer) {
+			fprintf(stderr, "Error: no programmer found in %s\n", loader_dir);
+			return 1;
+		}
+	} else if (optind >= argc) {
+		fprintf(stderr, "Error: programmer file or -L <dir> required\n");
 		return 1;
 	}
 
-	ret = firehose_session_open(&qdl, argv[optind], storage_type, serial,
-				    use_pcie);
-	if (ret)
+	ret = firehose_session_open(&qdl, programmer ? programmer : argv[optind],
+				    storage_type, serial, use_pcie);
+	if (ret) {
+		free(programmer);
 		return 1;
+	}
 
 	ret = gpt_set_active_slot(qdl, slot);
 	if (ret == 0)
 		printf("Active slot set to: %c\n", slot);
 
 	firehose_session_close(qdl, ret == 0);
+	free(programmer);
 	return !!ret;
 }
 
@@ -1886,6 +1987,8 @@ static int qdl_readall(int argc, char **argv)
 	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
 	struct qdl_device *qdl = NULL;
 	const char *outdir = ".";
+	char *loader_dir = NULL;
+	char *programmer = NULL;
 	bool use_pcie = false;
 	char *serial = NULL;
 	int opt;
@@ -1897,12 +2000,13 @@ static int qdl_readall(int argc, char **argv)
 		{"serial", required_argument, 0, 'S'},
 		{"storage", required_argument, 0, 's'},
 		{"output", required_argument, 0, 'o'},
+		{"find-loader", required_argument, 0, 'L'},
 		{"pcie", no_argument, 0, 'P'},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
 
-	while ((opt = getopt_long(argc, argv, "dvS:s:o:Ph", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "dvS:s:o:L:Ph", options, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			qdl_debug = true;
@@ -1919,29 +2023,41 @@ static int qdl_readall(int argc, char **argv)
 		case 'o':
 			outdir = optarg;
 			break;
+		case 'L':
+			loader_dir = optarg;
+			break;
 		case 'P':
 			use_pcie = true;
 			break;
 		case 'h':
 		default:
-			fprintf(stderr, "Usage: qfenix readall <programmer> [-o outdir] [--debug] [--serial=S] [--storage=T] [--pcie]\n");
+			fprintf(stderr, "Usage: qfenix readall [-L dir | <programmer>] [-o outdir] [--serial=S] [--storage=T] [--pcie]\n");
 			return opt == 'h' ? 0 : 1;
 		}
 	}
 
-	if (optind >= argc) {
-		fprintf(stderr, "Error: programmer file required\n");
+	if (loader_dir) {
+		programmer = find_programmer_recursive(loader_dir);
+		if (!programmer) {
+			fprintf(stderr, "Error: no programmer found in %s\n", loader_dir);
+			return 1;
+		}
+	} else if (optind >= argc) {
+		fprintf(stderr, "Error: programmer file or -L <dir> required\n");
 		return 1;
 	}
 
-	ret = firehose_session_open(&qdl, argv[optind], storage_type, serial,
-				    use_pcie);
-	if (ret)
+	ret = firehose_session_open(&qdl, programmer ? programmer : argv[optind],
+				    storage_type, serial, use_pcie);
+	if (ret) {
+		free(programmer);
 		return 1;
+	}
 
 	ret = gpt_read_all_partitions(qdl, outdir);
 
 	firehose_session_close(qdl, false);
+	free(programmer);
 	return !!ret;
 }
 
@@ -2278,6 +2394,8 @@ static int qdl_flash(int argc, char **argv)
 	char *incdir = NULL;
 	char *serial = NULL;
 	char *firmware_dir = NULL;
+	char *loader_dir = NULL;
+	char *loader_programmer = NULL;
 	const char *vip_generate_dir = NULL;
 	const char *vip_table_path = NULL;
 	int type;
@@ -2310,12 +2428,13 @@ static int qdl_flash(int argc, char **argv)
 		{"no-auto-edl", no_argument, 0, 'E'},
 		{"skip-md5", no_argument, 0, 'M'},
 		{"firmware-dir", required_argument, 0, 'F'},
+		{"find-loader", required_argument, 0, 'L'},
 		{"pcie", no_argument, 0, 'P'},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
 
-	while ((opt = getopt_long(argc, argv, "dvi:lu:S:D:s:fcnt:T:EMF:Ph", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "dvi:lu:S:D:s:fcnt:T:EMF:L:Ph", options, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			qdl_debug = true;
@@ -2368,6 +2487,9 @@ static int qdl_flash(int argc, char **argv)
 		case 'F':
 			firmware_dir = optarg;
 			break;
+		case 'L':
+			loader_dir = optarg;
+			break;
 		case 'P':
 			qdl_dev_type = QDL_DEVICE_PCIE;
 			break;
@@ -2378,6 +2500,11 @@ static int qdl_flash(int argc, char **argv)
 			print_usage(stderr);
 			return 1;
 		}
+	}
+
+	if (firmware_dir && loader_dir) {
+		fprintf(stderr, "Error: cannot use both -F and -L\n");
+		return 1;
 	}
 
 	/* Handle firmware directory mode or require 2+ args */
@@ -2394,6 +2521,18 @@ static int qdl_flash(int argc, char **argv)
 
 		/* Use firehose directory as include directory */
 		incdir = fw.firehose_dir;
+	} else if (loader_dir) {
+		loader_programmer = find_programmer_recursive(loader_dir);
+		if (!loader_programmer) {
+			ux_err("no programmer found in %s\n", loader_dir);
+			return 1;
+		}
+		/* Still require XML files as positional args */
+		if ((optind + 1) > argc) {
+			fprintf(stderr, "Error: XML files required with -L\n");
+			free(loader_programmer);
+			return 1;
+		}
 	} else if ((optind + 2) > argc) {
 		print_usage(stderr);
 		return 1;
@@ -2470,7 +2609,10 @@ static int qdl_flash(int argc, char **argv)
 				" changes. Allow explicitly with --allow-fusing parameter");
 	} else {
 		/* Manual mode: load files from command line */
-		ret = decode_programmer(argv[optind++], sahara_images);
+		if (loader_programmer)
+			ret = decode_programmer(loader_programmer, sahara_images);
+		else
+			ret = decode_programmer(argv[optind++], sahara_images);
 		if (ret < 0)
 			exit(1);
 
@@ -2586,6 +2728,8 @@ out_cleanup:
 
 	if (firmware_dir)
 		firmware_free(&fw);
+
+	free(loader_programmer);
 
 	if (qdl->vip_data.state != VIP_DISABLED)
 		vip_transfer_deinit(qdl);
