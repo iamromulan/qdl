@@ -33,6 +33,65 @@ enum {
 	FIREHOSE_NAK,
 };
 
+/*
+ * Remainder buffer for serial stream reassembly.
+ *
+ * On COM port transport, the rawmode ACK XML and the following binary
+ * data may arrive concatenated in a single read.  When firehose_read()
+ * detects rawmode, it saves any trailing bytes (binary data) here so
+ * firehose_issue_read() can consume them before calling qdl_read().
+ */
+static char fh_remainder[4096];
+static size_t fh_remainder_len;
+
+static void fh_remainder_save(const char *data, size_t len)
+{
+	if (len > sizeof(fh_remainder))
+		len = sizeof(fh_remainder);
+	memcpy(fh_remainder, data, len);
+	fh_remainder_len = len;
+}
+
+static size_t fh_remainder_drain(void *buf, size_t max)
+{
+	size_t n = fh_remainder_len;
+
+	if (n == 0)
+		return 0;
+	if (n > max)
+		n = max;
+
+	memcpy(buf, fh_remainder, n);
+	fh_remainder_len -= n;
+	if (fh_remainder_len > 0)
+		memmove(fh_remainder, fh_remainder + n, fh_remainder_len);
+
+	return n;
+}
+
+/*
+ * Length-limited memory search (like memmem but portable to MSYS2).
+ */
+static void *find_in_mem(const void *haystack, size_t hay_len,
+			 const void *needle, size_t needle_len)
+{
+	const char *h = haystack;
+	const char *n = needle;
+	size_t i;
+
+	if (needle_len == 0)
+		return (void *)haystack;
+	if (needle_len > hay_len)
+		return NULL;
+
+	for (i = 0; i <= hay_len - needle_len; i++) {
+		if (h[i] == n[0] && memcmp(h + i, n, needle_len) == 0)
+			return (void *)(h + i);
+	}
+
+	return NULL;
+}
+
 static void xml_setpropf(xmlNode *node, const char *attr, const char *fmt, ...)
 {
 	xmlChar buf[128];
@@ -78,6 +137,8 @@ static xmlNode *firehose_response_parse(const void *buf, size_t len, int *error)
 	if (!node) {
 		ux_err("empty firehose response\n");
 		*error = -EINVAL;
+		xmlFreeDoc(doc);
+		return NULL;
 	}
 
 	return node;
@@ -160,7 +221,7 @@ static int firehose_read(struct qdl_device *qdl, int timeout_ms,
 	 * consumption of incoming data.
 	 */
 	for (;;) {
-		n = qdl_read(qdl, buf, sizeof(buf), 100);
+		n = qdl_read(qdl, buf, sizeof(buf) - 1, 100);
 
 		/* Timeout after seeing a response, we're done waiting for logs */
 		if (n == -ETIMEDOUT && resp >= 0)
@@ -180,15 +241,90 @@ static int firehose_read(struct qdl_device *qdl, int timeout_ms,
 
 		ux_debug("FIREHOSE READ: %s\n", buf);
 
-		node = firehose_response_parse(buf, n, &error);
-		if (!node)
-			return error;
+		/*
+		 * COM port transport may deliver multiple XML documents
+		 * in a single read (serial is a byte stream, unlike USB
+		 * where each bulk transfer is a separate message).
+		 *
+		 * Additionally, a rawmode ACK may arrive concatenated
+		 * with binary data that follows it.  We use the actual
+		 * byte count (n) instead of strlen to handle embedded
+		 * null bytes in binary data, truncate XML fragments at
+		 * </data> boundaries, and save any trailing binary data
+		 * as remainder for the raw-read loop.
+		 */
+		char *frag = buf;
+		size_t buf_left = (size_t)n;
 
-		ret = response_parser(node, data, &rawmode);
-		xmlFreeDoc(node->doc);
+		while (buf_left > 0) {
+			char *next_xml;
+			char *data_end;
+			size_t frag_len;
+			size_t xml_len;
 
-		if (ret >= 0)
-			resp = ret;
+			/*
+			 * Skip leading non-XML bytes — null bytes or
+			 * binary residue from serial stream.
+			 */
+			while (buf_left > 0 && *frag != '<') {
+				frag++;
+				buf_left--;
+			}
+			if (buf_left == 0)
+				break;
+
+			/* Find next <?xml document boundary (null-safe) */
+			next_xml = NULL;
+			if (buf_left > 5)
+				next_xml = find_in_mem(frag + 1, buf_left - 1,
+						       "<?xml", 5);
+
+			frag_len = next_xml ? (size_t)(next_xml - frag)
+					    : buf_left;
+
+			/*
+			 * Truncate at </data> to separate XML from any
+			 * trailing binary data (e.g. rawmode payload).
+			 * Use find_in_mem for null-safety and to stay
+			 * within fragment bounds.
+			 */
+			data_end = find_in_mem(frag, frag_len,
+					       "</data>", 7);
+			xml_len = frag_len;
+			if (data_end)
+				xml_len = (size_t)(data_end - frag) + 7;
+
+			node = firehose_response_parse(frag, xml_len, &error);
+			if (node) {
+				ret = response_parser(node, data, &rawmode);
+				xmlFreeDoc(node->doc);
+
+				if (ret >= 0)
+					resp = ret;
+			}
+
+			if (rawmode) {
+				/*
+				 * Save any data after the XML as
+				 * remainder — this is the start of the
+				 * binary raw-mode payload that arrived
+				 * in the same read.
+				 */
+				char *after = frag + xml_len;
+				size_t leftover = buf_left - xml_len;
+
+				if (leftover > 0)
+					fh_remainder_save(after, leftover);
+				break;
+			}
+
+			if (next_xml) {
+				buf_left -= (size_t)(next_xml - frag);
+				frag = next_xml;
+			} else {
+				break;
+			}
+		}
 
 		if (rawmode)
 			break;
@@ -689,16 +825,31 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 
 	left = read_op->num_sectors;
 	while (left > 0) {
+		size_t wanted;
+		size_t got;
+
 		chunk_size = MIN(qdl->max_payload_size / sector_size, left);
+		wanted = chunk_size * sector_size;
 
-		n = qdl_read(qdl, buf, chunk_size * sector_size, 30000);
-		if (n < 0) {
-			err(1, "failed to read");
+		/*
+		 * On serial transports the rawmode ACK and the start
+		 * of the binary payload may arrive in one read, with
+		 * firehose_read() saving the overflow to a remainder
+		 * buffer.  Drain that first, then read the rest from
+		 * the device, looping as needed since serial reads
+		 * can return partial results.
+		 */
+		got = fh_remainder_drain(buf, wanted);
+		while (got < wanted) {
+			n = qdl_read(qdl, (char *)buf + got,
+				     wanted - got, 30000);
+			if (n < 0)
+				err(1, "failed to read");
+			if (n == 0)
+				err(1, "unexpected EOF during raw read");
+			got += (size_t)n;
 		}
-
-		if ((size_t)n != chunk_size * sector_size) {
-			err(1, "failed to read full sector");
-		}
+		n = (int)got;
 
 		if (out_buf) {
 			if ((size_t)n > out_len - out_offset)

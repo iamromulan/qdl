@@ -22,6 +22,7 @@
 #include "pcie.h"
 
 #ifdef __linux__
+#include <poll.h>
 #include <sys/ioctl.h>
 
 /* DIAG command to switch Qualcomm devices to EDL mode */
@@ -268,11 +269,18 @@ static int pcie_read(struct qdl_device *qdl, void *buf, size_t len,
 		     unsigned int timeout)
 {
 	struct qdl_device_pcie *pcie;
+	struct pollfd pfd;
 	int ret;
 
-	(void)timeout;
-
 	pcie = container_of(qdl, struct qdl_device_pcie, base);
+
+	pfd.fd = pcie->edl_fd;
+	pfd.events = POLLIN;
+	ret = poll(&pfd, 1, timeout ? (int)timeout : 30000);
+	if (ret < 0)
+		return -errno;
+	if (ret == 0)
+		return -ETIMEDOUT;
 
 	ret = read(pcie->edl_fd, buf, len);
 	if (ret < 0)
@@ -555,10 +563,16 @@ static int pcie_open_win(struct qdl_device *qdl, const char *serial)
 		return -1;
 	}
 
-	/* Default timeout — overridden per-read by pcie_read_win */
-	timeouts.ReadIntervalTimeout = 50;
-	timeouts.ReadTotalTimeoutConstant = 5000;
+	/*
+	 * Use non-blocking reads (return immediately with available
+	 * data).  Some USB serial drivers (e.g. Qualcomm QDLoader 9008)
+	 * ignore ReadTotalTimeoutConstant and block ReadFile
+	 * indefinitely.  Timeouts are enforced in pcie_read_win()
+	 * via a polling loop instead.  This matches Qflash's approach.
+	 */
+	timeouts.ReadIntervalTimeout = MAXDWORD;
 	timeouts.ReadTotalTimeoutMultiplier = 0;
+	timeouts.ReadTotalTimeoutConstant = 0;
 	timeouts.WriteTotalTimeoutConstant = 5000;
 	timeouts.WriteTotalTimeoutMultiplier = 0;
 
@@ -567,7 +581,11 @@ static int pcie_open_win(struct qdl_device *qdl, const char *serial)
 		return -1;
 	}
 
-	PurgeComm(hSerial, PURGE_RXCLEAR | PURGE_TXCLEAR);
+	/*
+	 * Only purge TX — preserve any Sahara hello the device already
+	 * sent while we were waiting for the COM port to appear.
+	 */
+	PurgeComm(hSerial, PURGE_TXCLEAR);
 
 	pcie->hSerial = hSerial;
 	ux_info("EDL port %s opened\n", port);
@@ -578,24 +596,29 @@ static int pcie_read_win(struct qdl_device *qdl, void *buf, size_t len,
 			 unsigned int timeout)
 {
 	struct qdl_device_pcie_win *pcie;
-	COMMTIMEOUTS timeouts = {0};
+	DWORD deadline;
 	DWORD n = 0;
 
 	pcie = container_of(qdl, struct qdl_device_pcie_win, base);
+	deadline = GetTickCount() + (timeout ? timeout : 5000);
 
-	/* Apply the requested timeout */
-	timeouts.ReadIntervalTimeout = 50;
-	timeouts.ReadTotalTimeoutConstant = timeout ? timeout : 5000;
-	timeouts.ReadTotalTimeoutMultiplier = 0;
-	SetCommTimeouts(pcie->hSerial, &timeouts);
+	/*
+	 * Poll with non-blocking ReadFile until data arrives or
+	 * the timeout expires.  COMMTIMEOUTS is configured for
+	 * immediate return so this works even with drivers that
+	 * ignore ReadTotalTimeoutConstant.
+	 */
+	do {
+		if (!ReadFile(pcie->hSerial, buf, (DWORD)len, &n, NULL))
+			return -EIO;
 
-	if (!ReadFile(pcie->hSerial, buf, (DWORD)len, &n, NULL))
-		return -1;
+		if (n > 0)
+			return (int)n;
 
-	if (n == 0)
-		return -1;
+		Sleep(10);
+	} while (GetTickCount() < deadline);
 
-	return (int)n;
+	return -ETIMEDOUT;
 }
 
 static int pcie_write_win(struct qdl_device *qdl, const void *buf, size_t len,
@@ -609,7 +632,7 @@ static int pcie_write_win(struct qdl_device *qdl, const void *buf, size_t len,
 	pcie = container_of(qdl, struct qdl_device_pcie_win, base);
 
 	if (!WriteFile(pcie->hSerial, buf, (DWORD)len, &written, NULL))
-		return -1;
+		return -EIO;
 
 	return (int)written;
 }
