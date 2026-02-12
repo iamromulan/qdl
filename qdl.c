@@ -726,34 +726,59 @@ static void print_usage(FILE *out)
 {
 	extern const char *__progname;
 
-	fprintf(out, "qfenix - Qualcomm Firehose / DIAG multi-tool\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "qfenix");
+	fprintf(out, " - Qualcomm Firehose / DIAG multi-tool\n");
 #ifdef BUILD_STATIC
-	fprintf(out, "qfenix %s, %s %s, static binary\n\n", VERSION, __DATE__, __TIME__);
+	fprintf(out, "%s, %s %s, static binary\n", VERSION, __DATE__, __TIME__);
 #else
-	fprintf(out, "qfenix %s, %s %s, dynamically linked\n\n", VERSION, __DATE__, __TIME__);
+	fprintf(out, "%s, %s %s, dynamically linked\n", VERSION, __DATE__, __TIME__);
 #endif
-	fprintf(out, "Usage: %s [options] <prog.mbn> <program-xml|patch-xml|read-xml>...\n", __progname);
-	fprintf(out, "       %s [options] -F <firmware-dir>\n", __progname);
+
+	fprintf(out, "\nUsage: %s [options] -F <firmware-dir>\n", __progname);
+	fprintf(out, "       %s [options] <prog.mbn> <read-xml|patch-xml|program-xml>...\n", __progname);
 	fprintf(out, "       %s [options] <prog.mbn> (read|write) <address> <binary>...\n", __progname);
-	fprintf(out, "\nSubcommands:\n");
-	fprintf(out, "  list          List connected EDL, DIAG, and PCIe devices\n");
-	fprintf(out, "  diag2edl      Switch a device from DIAG to EDL mode\n");
-	fprintf(out, "  printgpt      Print GPT partition tables\n");
+	fprintf(out, "       %s [subcommand] [options] (--help to see options for each subcommand)\n", __progname);
+
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "\nEDL Subcommands");
+	fprintf(out, " (require a firehose programmer/loader):\n");
+	fprintf(out, "\n  The loader/programmer can be provided 3 ways:\n");
+	fprintf(out, "    1. Auto-detected from current directory (or subdirectory)\n");
+	fprintf(out, "    2. -L <dir> to specify a search directory\n");
+	fprintf(out, "    3. Exact programmer path as a positional argument\n");
+	fprintf(out, "\n  flash         Flash firmware (same as -F)\n");
+	fprintf(out, "  printgpt      Print GPT/NAND partition tables\n");
+	fprintf(out, "                  (use --make-xml=program and/or --make-xml=read to generate XML)\n");
 	fprintf(out, "  storageinfo   Query storage hardware information\n");
-	fprintf(out, "  reset         Reset, power-off, or EDL-reboot a device\n");
+	fprintf(out, "  reset         Reset, power-off, or EDL-reboot a device (default: reset)\n");
 	fprintf(out, "  getslot       Show the active A/B slot\n");
 	fprintf(out, "  setslot       Set the active A/B slot (a or b)\n");
-	fprintf(out, "  read          Read a single partition by label\n");
+	fprintf(out, "  read          Read partition(s) by label\n");
 	fprintf(out, "  readall       Dump all partitions to files\n");
+
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "\nDIAG Subcommands");
+	fprintf(out, " (work directly on DIAG port, no programmer needed):\n");
+	fprintf(out, "  diag2edl      Switch a device from DIAG to EDL mode\n");
 	fprintf(out, "  nvread        Read an NV item via DIAG\n");
 	fprintf(out, "  nvwrite       Write an NV item via DIAG\n");
 	fprintf(out, "  efsls         List an EFS directory via DIAG\n");
 	fprintf(out, "  efsget        Download a file from EFS via DIAG\n");
 	fprintf(out, "  efsdump       Dump the EFS factory image via DIAG\n");
+
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "\nOther Subcommands");
+	fprintf(out, ":\n");
+	fprintf(out, "  list          List connected EDL, DIAG, and PCIe devices\n");
 	fprintf(out, "  ramdump       Extract RAM dumps via Sahara\n");
 	fprintf(out, "  ks            Keystore/Sahara over serial device nodes\n");
+
 	fprintf(out, "\nUse '%s <subcommand> --help' for detailed subcommand usage.\n", __progname);
-	fprintf(out, "\nFlash options:\n");
+
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "\nFlash Options");
+	fprintf(out, ":\n");
 	fprintf(out, "  -d, --debug               Print detailed debug info\n");
 	fprintf(out, "  -n, --dry-run             Dry run, no device reading or flashing\n");
 	fprintf(out, "  -f, --allow-missing       Allow skipping of missing files\n");
@@ -772,10 +797,15 @@ static void print_usage(FILE *out)
 	fprintf(out, "  -P, --pcie                Use PCIe/MHI transport instead of USB\n");
 	fprintf(out, "  -v, --version             Print version and exit\n");
 	fprintf(out, "  -h, --help                Print this usage info\n");
-	fprintf(out, "\nExamples:\n");
+
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "\nExamples");
+	fprintf(out, ":\n");
+	fprintf(out, "  %s flash /path/to/firmware/       Auto-detect and flash\n", __progname);
 	fprintf(out, "  %s -F /path/to/firmware/          Auto-detect and flash\n", __progname);
 	fprintf(out, "  %s prog_firehose_ddr.elf rawprogram*.xml patch*.xml\n", __progname);
-	fprintf(out, "  %s printgpt -L /path/to/firmware/ Print GPT from auto-detected loader\n", __progname);
+	fprintf(out, "  %s printgpt                       Print partitions (with loader in current dir)\n", __progname);
+	fprintf(out, "  %s readall -o backup/             Dump all partitions to backup/\n", __progname);
 	fprintf(out, "  %s list                           List connected devices\n", __progname);
 }
 
@@ -3041,6 +3071,8 @@ out_cleanup:
 
 int main(int argc, char **argv)
 {
+	ux_init();
+
 	if (argc >= 2 && !strcmp(argv[1], "list"))
 		return qdl_list(stdout);
 	if (argc >= 2 && !strcmp(argv[1], "ramdump"))
@@ -3073,6 +3105,83 @@ int main(int argc, char **argv)
 		return qdl_efsget(argc - 1, argv + 1);
 	if (argc >= 2 && !strcmp(argv[1], "efsdump"))
 		return qdl_efsdump(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "flash")) {
+		/*
+		 * "qfenix flash [options] [dir]" — treat bare positional
+		 * arg as firmware directory (like -F).  If no dir given,
+		 * default to current directory.
+		 */
+		int flash_argc = argc - 1;
+		char **flash_argv = argv + 1;
+
+		/* Check for --help before rewriting args */
+		for (int i = 1; i < flash_argc; i++) {
+			if (!strcmp(flash_argv[i], "--help") ||
+			    !strcmp(flash_argv[i], "-h")) {
+				fprintf(stdout,
+					"Usage: qfenix flash [options] [directory]\n"
+					"\nFlash firmware from a directory. If no directory is given,\n"
+					"the current directory is searched for a programmer and XML files.\n"
+					"\nThis is equivalent to: qfenix -F <directory>\n"
+					"\nOptions:\n"
+					"  -d, --debug               Print detailed debug info\n"
+					"  -s, --storage=T           Set storage type: emmc|nand|nvme|spinor|ufs\n"
+					"  -S, --serial=T            Target by serial number or COM port name\n"
+					"  -f, --allow-missing       Allow skipping of missing files\n"
+					"  -M, --skip-md5            Skip MD5 verification\n"
+					"  -E, --no-auto-edl         Disable automatic DIAG to EDL switching\n"
+					"  -P, --pcie                Use PCIe/MHI transport\n"
+					"  -h, --help                Print this help\n");
+				return 0;
+			}
+		}
+
+		/*
+		 * If the last arg looks like a directory (no leading -)
+		 * and -F wasn't already given, rewrite it as -F <dir>.
+		 * If no positional args at all, default to -F .
+		 */
+		bool has_F = false;
+		for (int i = 1; i < flash_argc; i++) {
+			if (!strcmp(flash_argv[i], "-F") ||
+			    !strncmp(flash_argv[i], "--firmware-dir", 14))
+				has_F = true;
+		}
+
+		if (!has_F) {
+			/* Build new argv: progname -F <dir> [original options] */
+			char **new_argv = calloc(flash_argc + 3, sizeof(char *));
+			int n = 0;
+
+			new_argv[n++] = flash_argv[0];
+			new_argv[n++] = "-F";
+
+			/* Find the positional arg (no leading -) */
+			char *dir_arg = NULL;
+			int dir_idx = -1;
+			for (int i = flash_argc - 1; i >= 1; i--) {
+				if (flash_argv[i][0] != '-') {
+					dir_arg = flash_argv[i];
+					dir_idx = i;
+					break;
+				}
+			}
+			new_argv[n++] = dir_arg ? dir_arg : ".";
+
+			/* Copy remaining options (skip the dir arg) */
+			for (int i = 1; i < flash_argc; i++) {
+				if (i != dir_idx)
+					new_argv[n++] = flash_argv[i];
+			}
+			new_argv[n] = NULL;
+
+			int ret = qdl_flash(n, new_argv);
+			free(new_argv);
+			return ret;
+		}
+
+		return qdl_flash(flash_argc, flash_argv);
+	}
 
 	return qdl_flash(argc, argv);
 }

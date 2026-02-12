@@ -80,12 +80,11 @@ static uint8_t to_hex(uint8_t ch)
 
 void print_version(void)
 {
-	fprintf(stdout, "qfenix\n");
-	fprintf(stdout, "A qdl fork that aims to add more features, by iamromulan.\n");
+	fprintf(stdout, "qfenix - Qualcomm Firehose / DIAG multi-tool\n");
 #ifdef BUILD_STATIC
-	fprintf(stdout, "qfenix %s, %s %s, static binary\n", VERSION, __DATE__, __TIME__);
+	fprintf(stdout, "%s, %s %s, static binary\n", VERSION, __DATE__, __TIME__);
 #else
-	fprintf(stdout, "qfenix %s, %s %s, dynamically linked\n", VERSION, __DATE__, __TIME__);
+	fprintf(stdout, "%s, %s %s, dynamically linked\n", VERSION, __DATE__, __TIME__);
 #endif
 }
 

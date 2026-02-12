@@ -171,7 +171,7 @@ static int usb_try_open(libusb_device *dev, struct qdl_device_usb *qdl, const ch
 		qdl->out_maxpktsize = out_size;
 
 		if (qdl->out_chunk_size && qdl->out_chunk_size % out_size) {
-			ux_err("WARNING: requested out-chunk-size must be multiple of the device's wMaxPacketSize %ld, using %ld\n",
+			ux_warn("WARNING: requested out-chunk-size must be multiple of the device's wMaxPacketSize %ld, using %ld\n",
 			       out_size, out_size);
 			qdl->out_chunk_size = out_size;
 		} else if (!qdl->out_chunk_size) {

@@ -918,7 +918,7 @@ static int nand_read_all_partitions(struct qdl_device *qdl, const char *outdir)
 		count, failed, outdir);
 
 	if (ubi_count > 0)
-		ux_err("WARNING: %d UBI partition(s) were read as raw NAND images.\n"
+		ux_warn("WARNING: %d UBI partition(s) were read as raw NAND images.\n"
 		       "  Raw UBI images have device-specific erase counters and wear-leveling\n"
 		       "  data baked in. Flashing them to another device (or even the same device)\n"
 		       "  will likely cause UBI errors and fail to mount.\n"
@@ -1086,7 +1086,7 @@ static int nand_read_partition(struct qdl_device *qdl, const char *label,
 		if (ret == 0) {
 			const char *dot = strrchr(outfile, '.');
 			if (dot && !strcmp(dot, ".ubi"))
-				ux_err("WARNING: '%s' is a raw UBI image read from NAND.\n"
+				ux_warn("WARNING: '%s' is a raw UBI image read from NAND.\n"
 				       "  Do not flash it directly — extract and re-ubinize first.\n"
 				       "  See: ubireader_extract_images / ubinize\n",
 				       outfile);
@@ -1225,7 +1225,7 @@ static int nand_read_partition_to_dir(struct qdl_device *qdl,
 					    num_pages, sector_size,
 					    pages_per_block, filepath);
 		if (ret == 0 && !strcmp(ext, ".ubi"))
-			ux_err("WARNING: '%s' is a raw UBI image read from NAND.\n"
+			ux_warn("WARNING: '%s' is a raw UBI image read from NAND.\n"
 			       "  Do not flash it directly — extract and re-ubinize first.\n"
 			       "  See: ubireader_extract_images / ubinize\n",
 			       filepath);

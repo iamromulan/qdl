@@ -476,6 +476,7 @@ int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 
 	while (!done) {
 		int retries = 15;
+		bool sent_reset = false;
 
 		/*
 		 * Accumulate data until we have a complete Sahara packet.
@@ -502,12 +503,19 @@ int sahara_run(struct qdl_device *qdl, const struct sahara_image *images,
 			 * On COM port transport (Windows QDLoader/PCIe),
 			 * the initial Sahara hello is almost always lost
 			 * (sent before the port was opened).  Send a
-			 * reset quickly to trigger a fresh hello before
-			 * the PBL times out (typically 2-5 seconds).
+			 * reset immediately on first failure to trigger
+			 * a fresh hello, then periodically retry.
+			 *
+			 * On USB the hello can also be missed if the
+			 * device just entered EDL and hasn't fully
+			 * initialized — the same reset approach works.
 			 */
-			if (!done && (retries == 13 || retries == 9 ||
-				      retries == 5))
+			if (!done && !sent_reset) {
 				sahara_send_reset(qdl);
+				sent_reset = true;
+			} else if (!done && (retries == 9 || retries == 5)) {
+				sahara_send_reset(qdl);
+			}
 		} while (--retries > 0);
 
 		if (buf_len < 8) {

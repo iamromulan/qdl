@@ -140,12 +140,21 @@ unsigned int attr_as_unsigned(xmlNode *node, const char *attr, int *errors);
 const char *attr_as_string(xmlNode *node, const char *attr, int *errors);
 bool attr_as_bool(xmlNode *node, const char *attr, int *errors);
 
+/* ANSI color codes for UX output */
+#define UX_COLOR_RESET   "\033[0m"
+#define UX_COLOR_RED     "\033[31m"
+#define UX_COLOR_YELLOW  "\033[33m"
+#define UX_COLOR_GREEN   "\033[38;5;121m"
+#define UX_COLOR_BOLD    "\033[1m"
+
 void ux_init(void);
 void ux_err(const char *fmt, ...);
+void ux_warn(const char *fmt, ...);
 void ux_info(const char *fmt, ...);
 void ux_log(const char *fmt, ...);
 void ux_debug(const char *fmt, ...);
 void ux_progress(const char *fmt, unsigned int value, unsigned int size, ...);
+void ux_fputs_color(FILE *f, const char *color, const char *text);
 
 void normalize_path(char *path);
 int mkpath(const char *file_path);
