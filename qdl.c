@@ -660,21 +660,25 @@ static int firmware_detect(const char *base_dir, struct firmware_files *fw)
 	/* Find rawprogram XML files recursively */
 	find_files_recursive(base_dir, "rawprogram", ".xml",
 			     &fw->rawprogram, &fw->rawprogram_count);
-	if (fw->rawprogram_count == 0) {
-		ux_err("no rawprogram XML files found under %s\n", base_dir);
-		return -1;
-	}
-
-	/* Detect storage type from first rawprogram filename */
-	fw->storage_type = detect_storage_from_filename(fw->rawprogram[0]);
-
-	/* Find patch XML files recursively */
-	find_files_recursive(base_dir, "patch", ".xml",
-			     &fw->patch, &fw->patch_count);
 
 	/* Find rawread XML files recursively */
 	find_files_recursive(base_dir, "rawread", ".xml",
 			     &fw->rawread, &fw->rawread_count);
+
+	if (fw->rawprogram_count == 0 && fw->rawread_count == 0) {
+		ux_err("no rawprogram or rawread XML files found under %s\n", base_dir);
+		return -1;
+	}
+
+	/* Detect storage type from first rawprogram or rawread filename */
+	if (fw->rawprogram_count > 0)
+		fw->storage_type = detect_storage_from_filename(fw->rawprogram[0]);
+	else
+		fw->storage_type = detect_storage_from_filename(fw->rawread[0]);
+
+	/* Find patch XML files recursively */
+	find_files_recursive(base_dir, "patch", ".xml",
+			     &fw->patch, &fw->patch_count);
 
 	ux_info("Firmware directory: %s\n", base_dir);
 	ux_info("  Programmer: %s\n", fw->programmer);
@@ -1628,6 +1632,9 @@ static int qdl_printgpt(int argc, char **argv)
 	struct qdl_device *qdl = NULL;
 	char *loader_dir = NULL;
 	char *programmer = NULL;
+	const char *outdir = ".";
+	bool make_read = false;
+	bool make_program = false;
 	bool storage_set = false;
 	bool use_pcie = false;
 	char *serial = NULL;
@@ -1640,12 +1647,14 @@ static int qdl_printgpt(int argc, char **argv)
 		{"serial", required_argument, 0, 'S'},
 		{"storage", required_argument, 0, 's'},
 		{"find-loader", required_argument, 0, 'L'},
+		{"make-xml", required_argument, 0, 'X'},
+		{"output", required_argument, 0, 'o'},
 		{"pcie", no_argument, 0, 'P'},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
 
-	while ((opt = getopt_long(argc, argv, "dvS:s:L:Ph", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "dvS:s:L:X:o:Ph", options, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			qdl_debug = true;
@@ -1663,12 +1672,31 @@ static int qdl_printgpt(int argc, char **argv)
 		case 'L':
 			loader_dir = optarg;
 			break;
+		case 'X':
+			if (strcmp(optarg, "read") == 0)
+				make_read = true;
+			else if (strcmp(optarg, "program") == 0)
+				make_program = true;
+			else {
+				fprintf(stderr, "Error: --make-xml must be 'read' or 'program'\n");
+				return 1;
+			}
+			break;
+		case 'o':
+			outdir = optarg;
+			break;
 		case 'P':
 			use_pcie = true;
 			break;
 		case 'h':
 		default:
-			fprintf(stderr, "Usage: qfenix printgpt [-L dir | <programmer>] [--serial=S] [--storage=T] [--pcie]\n");
+			fprintf(stderr, "Usage: qfenix printgpt [-L dir | <programmer>] [options]\n"
+				"  --make-xml=read       Generate rawread XML from partition table\n"
+				"  --make-xml=program    Generate rawprogram XML from partition table\n"
+				"  -o, --output=DIR      Output directory for generated XMLs (default: .)\n"
+				"  -S, --serial=S        Target by serial number or COM port\n"
+				"  -s, --storage=T       Set storage type: emmc|nand|ufs\n"
+				"  -P, --pcie            Use PCIe/MHI transport\n");
 			return opt == 'h' ? 0 : 1;
 		}
 	}
@@ -1683,7 +1711,6 @@ static int qdl_printgpt(int argc, char **argv)
 			storage_type = detect_storage_from_directory(loader_dir);
 	} else if (optind >= argc) {
 		fprintf(stderr, "Error: programmer file or -L <dir> required\n");
-		fprintf(stderr, "Usage: qfenix printgpt [-L dir | <programmer>] [--serial=S] [--storage=T] [--pcie]\n");
 		return 1;
 	}
 
@@ -1695,6 +1722,9 @@ static int qdl_printgpt(int argc, char **argv)
 	}
 
 	ret = gpt_print_table(qdl);
+
+	if (!ret && (make_read || make_program))
+		ret = gpt_make_xml(qdl, outdir, make_read, make_program);
 
 	firehose_session_close(qdl, true);
 	free(programmer);

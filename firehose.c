@@ -776,6 +776,7 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 {
 	unsigned int sector_size;
 	size_t chunk_size;
+	size_t buf_size;
 	size_t out_offset = 0;
 	xmlNode *root;
 	xmlNode *node;
@@ -787,7 +788,20 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 	int ret;
 	int n;
 
-	buf = malloc(qdl->max_payload_size);
+	/*
+	 * Use a large accumulation buffer to minimise disk-write
+	 * frequency during rawmode.  On serial transports (Windows
+	 * COM port), each write(fd) creates a brief gap during which
+	 * the driver's receive buffer accumulates incoming data.
+	 * With NAND's 16 KB max_payload_size a 120 MB partition
+	 * needs ~7 700 writes, and the cumulative gaps can overflow
+	 * the COM port buffer.  A 1 MB floor reduces that to ~120.
+	 */
+	buf_size = qdl->max_payload_size;
+	if (buf_size < 1024 * 1024)
+		buf_size = 1024 * 1024;
+
+	buf = malloc(buf_size);
 	if (!buf)
 		err(1, "failed to allocate sector buffer");
 
@@ -805,6 +819,8 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 	if (qdl->slot != UINT_MAX) {
 		xml_setpropf(node, "slot", "%u", qdl->slot);
 	}
+	if (read_op->pages_per_block)
+		xml_setpropf(node, "PAGES_PER_BLOCK", "%d", read_op->pages_per_block);
 	if (read_op->filename)
 		xml_setpropf(node, "filename", "%s", read_op->filename);
 
@@ -828,7 +844,7 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 		size_t wanted;
 		size_t got;
 
-		chunk_size = MIN(qdl->max_payload_size / sector_size, left);
+		chunk_size = MIN(buf_size / sector_size, left);
 		wanted = chunk_size * sector_size;
 
 		/*
@@ -843,10 +859,31 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 		while (got < wanted) {
 			n = qdl_read(qdl, (char *)buf + got,
 				     wanted - got, 30000);
-			if (n < 0)
-				err(1, "failed to read");
-			if (n == 0)
-				err(1, "unexpected EOF during raw read");
+			if (n < 0) {
+				ux_err("raw read failed (error %d) at %.1f%% of %s\n",
+				       n,
+				       100.0 * (read_op->num_sectors - left) / read_op->num_sectors,
+				       read_op->filename ? read_op->filename : "?");
+				/*
+				 * Write whatever we received before the
+				 * error so the output file is as complete
+				 * as possible (better to lose a few bytes
+				 * at the end than an entire chunk).
+				 */
+				if (got > 0 && fd >= 0)
+					(void)write(fd, buf, got);
+				ret = -1;
+				goto drain;
+			}
+			if (n == 0) {
+				ux_err("unexpected EOF at %.1f%% of %s\n",
+				       100.0 * (read_op->num_sectors - left) / read_op->num_sectors,
+				       read_op->filename ? read_op->filename : "?");
+				if (got > 0 && fd >= 0)
+					(void)write(fd, buf, got);
+				ret = -1;
+				goto drain;
+			}
 			got += (size_t)n;
 		}
 		n = (int)got;
@@ -871,9 +908,26 @@ static int firehose_issue_read(struct qdl_device *qdl, struct read_op *read_op,
 			ux_progress("%s", read_op->num_sectors - left, read_op->num_sectors, read_op->filename);
 	}
 
-	ret = firehose_read(qdl, 10000, firehose_generic_parser, NULL);
+drain:
+	/*
+	 * Drain remaining rawmode data and the closing ACK so the
+	 * stream is re-synchronised for subsequent commands.
+	 * On failure (mid-read error) discard whatever remains;
+	 * on success this consumes the normal rawmode=false ACK.
+	 */
+	fh_remainder_len = 0;
 	if (ret) {
-		ux_err("read operation failed\n");
+		int drain_n;
+
+		do {
+			drain_n = qdl_read(qdl, buf, buf_size, 2000);
+		} while (drain_n > 0);
+	}
+
+	if (firehose_read(qdl, 10000, firehose_generic_parser, NULL)) {
+		if (!ret)
+			ux_err("read operation failed\n");
+		ret = -1;
 		goto out;
 	}
 
@@ -1319,7 +1373,8 @@ int firehose_getstorageinfo(struct qdl_device *qdl,
 
 int firehose_read_to_file(struct qdl_device *qdl, unsigned int partition,
 			  unsigned int start_sector, unsigned int num_sectors,
-			  unsigned int sector_size, const char *filename)
+			  unsigned int sector_size, unsigned int pages_per_block,
+			  const char *filename)
 {
 	struct read_op op;
 	char start_str[32];
@@ -1330,6 +1385,7 @@ int firehose_read_to_file(struct qdl_device *qdl, unsigned int partition,
 
 	memset(&op, 0, sizeof(op));
 	op.sector_size = sector_size;
+	op.pages_per_block = pages_per_block;
 	op.start_sector = start_str;
 	op.num_sectors = num_sectors;
 	op.partition = partition;

@@ -539,13 +539,23 @@ static int pcie_open_win(struct qdl_device *qdl, const char *serial)
 		return -1;
 	}
 
+	/*
+	 * Request a large receive buffer to prevent data loss during
+	 * rawmode reads.  The programmer sends data continuously
+	 * without flow control; if the application can't drain the
+	 * driver buffer fast enough (e.g. during a disk-write gap),
+	 * excess data is silently dropped.  4 MB gives headroom for
+	 * scheduling jitter on top of the 1 MB application buffer.
+	 */
+	SetupComm(hSerial, 4 * 1024 * 1024, 1048576);
+
 	dcb.DCBlength = sizeof(dcb);
 	if (!GetCommState(hSerial, &dcb)) {
 		CloseHandle(hSerial);
 		return -1;
 	}
 
-	dcb.BaudRate = CBR_115200;
+	dcb.BaudRate = 921600;
 	dcb.ByteSize = 8;
 	dcb.StopBits = ONESTOPBIT;
 	dcb.Parity = NOPARITY;
@@ -565,10 +575,10 @@ static int pcie_open_win(struct qdl_device *qdl, const char *serial)
 
 	/*
 	 * Use non-blocking reads (return immediately with available
-	 * data).  Some USB serial drivers (e.g. Qualcomm QDLoader 9008)
-	 * ignore ReadTotalTimeoutConstant and block ReadFile
-	 * indefinitely.  Timeouts are enforced in pcie_read_win()
-	 * via a polling loop instead.  This matches Qflash's approach.
+	 * data).  Some USB serial drivers (e.g. Qualcomm QDLoader 9008
+	 * and QCMHI) do not correctly implement the MAXDWORD/MAXDWORD
+	 * blocking mode — ReadFile returns EIO or stalls indefinitely.
+	 * Timeouts are enforced in pcie_read_win() via a polling loop.
 	 */
 	timeouts.ReadIntervalTimeout = MAXDWORD;
 	timeouts.ReadTotalTimeoutMultiplier = 0;
@@ -606,7 +616,8 @@ static int pcie_read_win(struct qdl_device *qdl, void *buf, size_t len,
 	 * Poll with non-blocking ReadFile until data arrives or
 	 * the timeout expires.  COMMTIMEOUTS is configured for
 	 * immediate return so this works even with drivers that
-	 * ignore ReadTotalTimeoutConstant.
+	 * do not correctly implement blocking timeout modes
+	 * (e.g. Qualcomm QCMHI, QDLoader 9008).
 	 */
 	do {
 		if (!ReadFile(pcie->hSerial, buf, (DWORD)len, &n, NULL))
