@@ -4,6 +4,7 @@
 
 #include <stdbool.h>
 
+#include "list.h"
 #include "patch.h"
 #include "program.h"
 #include "read.h"
@@ -118,6 +119,8 @@ void ux_log(const char *fmt, ...);
 void ux_debug(const char *fmt, ...);
 void ux_progress(const char *fmt, unsigned int value, unsigned int size, ...);
 
+void normalize_path(char *path);
+int mkpath(const char *file_path);
 void print_version(void);
 
 int parse_storage_address(const char *address, int *physical_partition,
@@ -126,5 +129,32 @@ int parse_storage_address(const char *address, int *physical_partition,
 
 extern bool qdl_debug;
 extern bool qdl_auto_edl;
+
+enum firehose_op_type {
+	OP_ERASE,
+	OP_PROGRAM,
+	OP_READ,
+	OP_PATCH,
+};
+
+struct firehose_op {
+	enum firehose_op_type type;
+	union {
+		struct program *program;
+		struct read_op *read_op;
+		struct patch *patch;
+	};
+	struct list_head node;
+};
+
+void firehose_op_add_program(struct program *program);
+void firehose_op_add_read(struct read_op *read_op);
+void firehose_op_add_patch(struct patch *patch);
+int firehose_op_execute(struct qdl_device *qdl,
+			int (*apply_erase)(struct qdl_device *, struct program *),
+			int (*apply_program)(struct qdl_device *, struct program *, int),
+			int (*apply_read)(struct qdl_device *, struct read_op *, int),
+			int (*apply_patch)(struct qdl_device *, struct patch *));
+void free_firehose_ops(void);
 
 #endif

@@ -25,22 +25,7 @@ static struct list_head programs = LIST_INIT(programs);
 
 bool qdl_skip_md5 = false;
 
-/*
- * Normalize Windows-style paths to Unix-style
- * Converts backslashes to forward slashes in-place
- */
-static void normalize_path(char *path)
-{
-	char *p;
-
-	if (!path)
-		return;
-
-	for (p = path; *p; p++) {
-		if (*p == '\\')
-			*p = '/';
-	}
-}
+/* normalize_path() moved to util.c */
 
 static int load_erase_tag(xmlNode *node, bool is_nand)
 {
@@ -74,6 +59,7 @@ static int load_erase_tag(xmlNode *node, bool is_nand)
 	}
 
 	list_add(&programs, &program->node);
+	firehose_op_add_program(program);
 
 	return 0;
 }
@@ -103,6 +89,7 @@ static int program_load_sparse(struct program *program, int fd)
 		    lseek(fd, 0, SEEK_END)) {
 			program->sparse = false;
 			list_add(&programs, &program->node);
+			firehose_op_add_program(program);
 			return 0;
 		}
 
@@ -164,6 +151,7 @@ static int program_load_sparse(struct program *program, int fd)
 				program_sparse->sparse_fill_value = sparse_fill_value;
 
 			list_add(&programs, &program_sparse->node);
+			firehose_op_add_program(program_sparse);
 		}
 
 		start_sector = (unsigned int)strtoul(program->start_sector, NULL, 0);
@@ -266,6 +254,7 @@ static int load_program_tag(xmlNode *node, bool is_nand, bool allow_missing, con
 	}
 
 	list_add(&programs, &program->node);
+	firehose_op_add_program(program);
 
 	if (fd >= 0)
 		close(fd);
@@ -295,8 +284,12 @@ int program_load(const char *program_file, bool is_nand, bool allow_missing, con
 			errors = load_erase_tag(node, is_nand);
 		else if (!xmlStrcmp(node->name, (xmlChar *)"program"))
 			errors = load_program_tag(node, is_nand, allow_missing, incdir);
+		else if (!xmlStrcmp(node->name, (xmlChar *)"read"))
+			errors = read_op_load_tag(node, incdir);
+		else if (!xmlStrcmp(node->name, (xmlChar *)"patch"))
+			errors = patch_load_tag(node);
 		else {
-			ux_err("unrecognized tag \"%s\" in program-type file \"%s\"\n", node->name, program_file);
+			ux_err("unrecognized tag \"%s\" in \"%s\"\n", node->name, program_file);
 			errors = -EINVAL;
 		}
 
@@ -478,6 +471,7 @@ int program_cmd_add(const char *address, const char *filename)
 	program->gpt_partition = gpt_partition;
 
 	list_add(&programs, &program->node);
+	firehose_op_add_program(program);
 
 	return 0;
 }
