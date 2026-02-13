@@ -241,7 +241,7 @@ static int usb_open(struct qdl_device *qdl, const char *serial)
 		 * Signal the caller to fall back to COM port transport.
 		 */
 		if (scan_not_supported) {
-			if (++not_supported_scans >= 3) {
+			if (++not_supported_scans >= 1) {
 				ux_info("USB driver not WinUSB-compatible, trying COM port...\n");
 				libusb_exit(NULL);
 				return -2;

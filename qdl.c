@@ -50,6 +50,12 @@ enum {
 
 bool qdl_debug;
 
+static int sahara_run_with_retry(struct qdl_device *qdl,
+				 const struct sahara_image *images,
+				 const char *ramdump_path,
+				 const char *ramdump_filter,
+				 const char *serial);
+
 static int detect_type(const char *verb)
 {
 	xmlNode *root;
@@ -1343,7 +1349,7 @@ static int qdl_ramdump(int argc, char **argv)
 		goto out_cleanup;
 	}
 
-	ret = sahara_run(qdl, NULL, ramdump_path, filter);
+	ret = sahara_run_with_retry(qdl, NULL, ramdump_path, filter, serial);
 	if (ret < 0) {
 		ret = 1;
 		goto out_cleanup;
@@ -1548,6 +1554,50 @@ static int qdl_diag2edl(int argc, char **argv)
 }
 
 /*
+ * Wrapper around sahara_run() that retries with a COM port close/reopen
+ * cycle when the initial handshake fails.
+ *
+ * On Windows COM port transport, the device's Sahara HELLO is often
+ * sent before the port is opened and is lost.  The in-protocol reset
+ * retries don't always recover because the PBL may ignore resets
+ * after its initial HELLO times out.  Closing and reopening the port
+ * (which re-asserts DTR) reliably triggers the PBL to re-send HELLO.
+ */
+static int sahara_run_with_retry(struct qdl_device *qdl,
+				 const struct sahara_image *images,
+				 const char *ramdump_path,
+				 const char *ramdump_filter,
+				 const char *serial)
+{
+	int attempts = 3;
+	int ret;
+	int i;
+
+	for (i = 0; i < attempts; i++) {
+		ret = sahara_run(qdl, images, ramdump_path, ramdump_filter);
+		if (ret >= 0)
+			return ret;
+
+		if (i + 1 >= attempts)
+			break;
+
+		ux_info("retrying Sahara handshake (%d/%d)...\n",
+			i + 2, attempts);
+		qdl_close(qdl);
+#ifdef _WIN32
+		Sleep(500);
+#else
+		usleep(500000);
+#endif
+		ret = qdl_open(qdl, serial);
+		if (ret)
+			return -1;
+	}
+
+	return ret;
+}
+
+/*
  * Common Firehose session setup for interactive subcommands.
  * Opens device, uploads programmer via Sahara (USB) or BHI (PCIe),
  * configures Firehose.
@@ -1601,7 +1651,8 @@ static int firehose_session_open(struct qdl_device **qdl_out, char *programmer,
 
 		if (need_sahara) {
 			qdl->storage_type = storage;
-			ret = sahara_run(qdl, sahara_images, NULL, NULL);
+			ret = sahara_run_with_retry(qdl, sahara_images,
+						    NULL, NULL, serial);
 			if (ret < 0) {
 				qdl_close(qdl);
 				qdl_deinit(qdl);
@@ -1633,7 +1684,8 @@ static int firehose_session_open(struct qdl_device **qdl_out, char *programmer,
 
 		qdl->storage_type = storage;
 
-		ret = sahara_run(qdl, sahara_images, NULL, NULL);
+		ret = sahara_run_with_retry(qdl, sahara_images,
+					    NULL, NULL, serial);
 		if (ret < 0) {
 			qdl_close(qdl);
 			qdl_deinit(qdl);
@@ -3009,7 +3061,8 @@ static int qdl_flash(int argc, char **argv)
 			goto out_cleanup;
 
 		if (need_sahara) {
-			ret = sahara_run(qdl, sahara_images, NULL, NULL);
+			ret = sahara_run_with_retry(qdl, sahara_images,
+						    NULL, NULL, serial);
 			if (ret < 0)
 				goto out_cleanup;
 		}
@@ -3033,7 +3086,8 @@ static int qdl_flash(int argc, char **argv)
 		if (ret)
 			goto out_cleanup;
 
-		ret = sahara_run(qdl, sahara_images, NULL, NULL);
+		ret = sahara_run_with_retry(qdl, sahara_images,
+					    NULL, NULL, serial);
 		if (ret < 0)
 			goto out_cleanup;
 	}
