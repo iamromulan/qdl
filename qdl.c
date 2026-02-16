@@ -2637,11 +2637,14 @@ static int qdl_efsls(int argc, char **argv)
 	if (!sess)
 		return 1;
 
+	diag_offline(sess);
+
 	printf("%-4s %8s  %4s  %s\n", "Type", "Size", "Mode", "Name");
 	printf("---- --------  ----  ----\n");
 
 	ret = diag_efs_listdir(sess, path, efsls_print_entry, NULL);
 
+	diag_online(sess);
 	diag_close(sess);
 	return !!ret;
 }
@@ -2693,8 +2696,10 @@ static int qdl_efspull(int argc, char **argv)
 	if (!sess)
 		return 1;
 
+	diag_offline(sess);
 	ret = diag_efs_readfile(sess, src, dst);
 
+	diag_online(sess);
 	diag_close(sess);
 	return !!ret;
 }
@@ -2744,8 +2749,10 @@ static int qdl_efsdump(int argc, char **argv)
 	if (!sess)
 		return 1;
 
+	diag_offline(sess);
 	ret = diag_efs_dump(sess, output);
 
+	diag_online(sess);
 	diag_close(sess);
 	return !!ret;
 }
@@ -2794,8 +2801,10 @@ static int qdl_efspush(int argc, char **argv)
 	if (!sess)
 		return 1;
 
+	diag_offline(sess);
 	ret = diag_efs_put(sess, argv[optind], argv[optind + 1]);
 
+	diag_online(sess);
 	diag_close(sess);
 	return !!ret;
 }
@@ -2853,12 +2862,15 @@ static int qdl_efsrm(int argc, char **argv)
 	if (!sess)
 		return 1;
 
+	diag_offline(sess);
+
 	for (i = optind; i < argc; i++) {
 		ret = diag_efs_rm(sess, argv[i], recursive);
 		if (ret)
 			failed++;
 	}
 
+	diag_online(sess);
 	diag_close(sess);
 	return !!failed;
 }
@@ -2928,6 +2940,8 @@ static int qdl_efsstat(int argc, char **argv)
 	if (!sess)
 		return 1;
 
+	diag_offline(sess);
+
 	for (i = optind; i < argc; i++) {
 		ret = diag_efs_stat_path(sess, argv[i], &st);
 		if (ret) {
@@ -2951,6 +2965,7 @@ static int qdl_efsstat(int argc, char **argv)
 			printf("\n");
 	}
 
+	diag_online(sess);
 	diag_close(sess);
 	return 0;
 }
@@ -3008,6 +3023,8 @@ static int qdl_efsmkdir(int argc, char **argv)
 	if (!sess)
 		return 1;
 
+	diag_offline(sess);
+
 	for (i = optind; i < argc; i++) {
 		ret = diag_efs_mkdir_path(sess, argv[i], mode);
 		if (ret) {
@@ -3018,6 +3035,7 @@ static int qdl_efsmkdir(int argc, char **argv)
 		}
 	}
 
+	diag_online(sess);
 	diag_close(sess);
 	return !!failed;
 }
@@ -3072,6 +3090,8 @@ static int qdl_efschmod(int argc, char **argv)
 	if (!sess)
 		return 1;
 
+	diag_offline(sess);
+
 	for (i = optind + 1; i < argc; i++) {
 		ret = diag_efs_chmod_path(sess, argv[i], mode);
 		if (ret) {
@@ -3082,6 +3102,7 @@ static int qdl_efschmod(int argc, char **argv)
 		}
 	}
 
+	diag_online(sess);
 	diag_close(sess);
 	return !!failed;
 }
@@ -3130,11 +3151,13 @@ static int qdl_efsln(int argc, char **argv)
 	if (!sess)
 		return 1;
 
+	diag_offline(sess);
 	ret = diag_efs_ln(sess, argv[optind], argv[optind + 1]);
 	if (ret == 0)
 		ux_info("symlink '%s' -> '%s'\n",
 			argv[optind + 1], argv[optind]);
 
+	diag_online(sess);
 	diag_close(sess);
 	return !!ret;
 }
@@ -3185,6 +3208,8 @@ static int qdl_efsrl(int argc, char **argv)
 	if (!sess)
 		return 1;
 
+	diag_offline(sess);
+
 	for (i = optind; i < argc; i++) {
 		ret = diag_efs_readlink_path(sess, argv[i], buf, sizeof(buf));
 		if (ret) {
@@ -3194,6 +3219,7 @@ static int qdl_efsrl(int argc, char **argv)
 		}
 	}
 
+	diag_online(sess);
 	diag_close(sess);
 	return 0;
 }
@@ -3257,8 +3283,10 @@ static int qdl_efsbackup(int argc, char **argv)
 	if (!sess)
 		return 1;
 
+	diag_offline(sess);
 	ret = diag_efs_backup(sess, path, output, manual);
 
+	diag_online(sess);
 	diag_close(sess);
 	return !!ret;
 }
@@ -3307,8 +3335,10 @@ static int qdl_efsrestore(int argc, char **argv)
 	if (!sess)
 		return 1;
 
+	diag_offline(sess);
 	ret = diag_efs_restore(sess, argv[optind]);
 
+	diag_online(sess);
 	diag_close(sess);
 	return !!ret;
 }

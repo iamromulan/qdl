@@ -615,6 +615,44 @@ void diag_close(struct diag_session *sess)
 	free(sess);
 }
 
+static int diag_set_mode(struct diag_session *sess, uint16_t mode)
+{
+	uint8_t cmd[3];
+	uint8_t resp[64];
+	int n;
+
+	cmd[0] = DIAG_CONTROL_F;
+	memcpy(&cmd[1], &mode, 2);
+
+	n = diag_send(sess, cmd, sizeof(cmd), resp, sizeof(resp));
+	if (n < 1 || resp[0] != DIAG_CONTROL_F) {
+		ux_err("DIAG mode change failed (mode=%u)\n", mode);
+		return -1;
+	}
+
+	return 0;
+}
+
+int diag_offline(struct diag_session *sess)
+{
+	int ret;
+
+	ux_info("switching modem to offline mode\n");
+	ret = diag_set_mode(sess, DIAG_MODE_OFFLINE_D);
+	if (ret)
+		return ret;
+
+	/* Give the modem time to transition */
+	usleep(500000);
+	return 0;
+}
+
+int diag_online(struct diag_session *sess)
+{
+	ux_info("switching modem back to online mode\n");
+	return diag_set_mode(sess, DIAG_MODE_ONLINE);
+}
+
 int diag_send(struct diag_session *sess, const uint8_t *cmd, size_t cmd_len,
 	      uint8_t *resp, size_t resp_size)
 {

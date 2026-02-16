@@ -7,11 +7,19 @@
 #include <stdbool.h>
 
 /* DIAG command codes */
+#define DIAG_CONTROL_F		0x29
 #define DIAG_NV_READ_F		0x26
 #define DIAG_NV_WRITE_F		0x27
 #define DIAG_SPC_F		0x41
 #define DIAG_PASSWORD_F		0x46
 #define DIAG_SUBSYS_CMD_F	0x4B
+
+/* DIAG_CONTROL_F mode values */
+#define DIAG_MODE_OFFLINE_D	1
+#define DIAG_MODE_RESET		2
+#define DIAG_MODE_FTM		3
+#define DIAG_MODE_ONLINE	4
+#define DIAG_MODE_LPM		5
 
 /* NV subsystem ID for indexed reads/writes */
 #define DIAG_SUBSYS_NV		0x30
@@ -110,6 +118,10 @@ struct efs_stat {
 /* Session management */
 struct diag_session *diag_open(const char *serial);
 void diag_close(struct diag_session *sess);
+
+/* Mode control */
+int diag_offline(struct diag_session *sess);
+int diag_online(struct diag_session *sess);
 
 /* Low-level send/receive */
 int diag_send(struct diag_session *sess, const uint8_t *cmd, size_t cmd_len,
