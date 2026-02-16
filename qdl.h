@@ -104,8 +104,11 @@ struct qdl_device_desc {
 
 struct qdl_device_desc *usb_list(unsigned int *devices_found);
 
-int firehose_run(struct qdl_device *qdl);
+int firehose_run(struct qdl_device *qdl, bool erase_all);
 int firehose_provision(struct qdl_device *qdl);
+int firehose_erase_partition(struct qdl_device *qdl, unsigned int partition,
+			     unsigned int start_sector, unsigned int num_sectors,
+			     unsigned int pages_per_block);
 int firehose_read_buf(struct qdl_device *qdl, struct read_op *read_op, void *out_buf, size_t out_size);
 int firehose_detect_and_configure(struct qdl_device *qdl,
 				  bool skip_storage_init,
@@ -192,6 +195,11 @@ int firehose_op_execute(struct qdl_device *qdl,
 			int (*apply_program)(struct qdl_device *, struct program *, int),
 			int (*apply_read)(struct qdl_device *, struct read_op *, int),
 			int (*apply_patch)(struct qdl_device *, struct patch *));
+int firehose_op_execute_phased(struct qdl_device *qdl,
+			       int (*erase_all_fn)(struct qdl_device *),
+			       int (*apply_program)(struct qdl_device *, struct program *, int),
+			       int (*apply_read)(struct qdl_device *, struct read_op *, int),
+			       int (*apply_patch)(struct qdl_device *, struct patch *));
 void free_firehose_ops(void);
 
 #endif

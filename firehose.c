@@ -27,6 +27,7 @@
 #include "oscompat.h"
 #include "vip.h"
 #include "sparse.h"
+#include "gpt.h"
 
 enum {
 	FIREHOSE_ACK = 0,
@@ -579,6 +580,26 @@ static int firehose_erase(struct qdl_device *qdl, struct program *program)
 out:
 	xmlFreeDoc(doc);
 	return ret == FIREHOSE_ACK ? 0 : -1;
+}
+
+int firehose_erase_partition(struct qdl_device *qdl, unsigned int partition,
+			     unsigned int start_sector, unsigned int num_sectors,
+			     unsigned int pages_per_block)
+{
+	struct program prog = {};
+	char sector_str[16];
+
+	snprintf(sector_str, sizeof(sector_str), "%u", start_sector);
+	prog.partition = partition;
+	prog.start_sector = sector_str;
+	prog.num_sectors = num_sectors;
+	prog.sector_size = qdl->sector_size;
+	if (pages_per_block) {
+		prog.is_nand = true;
+		prog.pages_per_block = pages_per_block;
+	}
+
+	return firehose_erase(qdl, &prog);
 }
 
 static int firehose_program(struct qdl_device *qdl, struct program *program, int fd)
@@ -1230,7 +1251,7 @@ int firehose_provision(struct qdl_device *qdl)
 
 }
 
-int firehose_run(struct qdl_device *qdl)
+int firehose_run(struct qdl_device *qdl, bool erase_all)
 {
 	bool multiple;
 	int bootable;
@@ -1250,8 +1271,15 @@ int firehose_run(struct qdl_device *qdl)
 	if (ret)
 		return ret;
 
-	ret = firehose_op_execute(qdl, firehose_erase, firehose_program,
-				  firehose_read_op, firehose_apply_patch);
+	if (erase_all)
+		ret = firehose_op_execute_phased(qdl,
+						 gpt_erase_all_partitions,
+						 firehose_program,
+						 firehose_read_op,
+						 firehose_apply_patch);
+	else
+		ret = firehose_op_execute(qdl, firehose_erase, firehose_program,
+					  firehose_read_op, firehose_apply_patch);
 	if (ret)
 		return ret;
 

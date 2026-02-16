@@ -31,8 +31,12 @@ the original QDL:
 - **PCIe/MHI Transport** - Flash PCIe-connected modems (T99W175,
   T99W373, T99W640, etc.) via MHI BHI on Linux or COM ports on Windows.
   Auto-detected when `/dev/mhi_*` devices are present (`--pcie` flag optional).
-- **DIAG Protocol** - NV item read/write, EFS directory listing, file download, and
-  factory image dump — all over the DIAG serial port.
+- **DIAG Protocol** - NV item read/write, full EFS filesystem management (list, pull,
+  push, stat, mkdir, chmod, symlink, delete), factory image dump, EFS backup/restore
+  to standard TAR archives — all over the DIAG serial port.
+- **Partition Erase** - Erase individual partitions by label (`erase`) or wipe all
+  partitions at once (`eraseall`). The `flash -e` flag provides an atomic
+  backup-erase-flash workflow: reads first, then erases all, then programs.
 - **Comprehensive Device Listing** - `qfenix list` shows USB EDL devices, DIAG serial
   ports, and PCIe MHI devices across all transports.
 - **GPT Inspection & A/B Slots** - Print partition tables, query/set the active A/B
@@ -76,11 +80,12 @@ qfenix prog_firehose_ddr.elf rawprogram*.xml patch*.xml
 
 ### Subcommands
 
+**Flashing & Storage:**
+
 | Subcommand | Description |
 |------------|-------------|
 | *(default)* | Flash firmware (Firehose protocol) |
-| `list` | List connected EDL, DIAG, and PCIe devices |
-| `diag2edl` | Switch a device from DIAG mode to EDL mode |
+| `flash` | Flash firmware (explicit subcommand, same as default) |
 | `printgpt` | Print GPT partition tables from a live device |
 | `storageinfo` | Query storage hardware information |
 | `reset` | Reset/power-off/EDL-reboot a device |
@@ -88,11 +93,34 @@ qfenix prog_firehose_ddr.elf rawprogram*.xml patch*.xml
 | `setslot` | Set the active A/B slot |
 | `read` | Read one or more partitions by label |
 | `readall` | Dump all partitions to files |
+| `erase` | Erase one or more partitions by label |
+| `eraseall` | Erase all partitions on the device |
+
+**DIAG Operations** (work directly on DIAG port, no programmer needed):
+
+| Subcommand | Description |
+|------------|-------------|
+| `diag2edl` | Switch a device from DIAG mode to EDL mode |
 | `nvread` | Read an NV item via DIAG |
 | `nvwrite` | Write an NV item via DIAG |
-| `efsls` | List an EFS directory via DIAG |
-| `efsget` | Download a file from EFS via DIAG |
-| `efsdump` | Dump the EFS factory image via DIAG |
+| `efsls` | List an EFS directory |
+| `efspull` | Download a file from EFS |
+| `efspush` | Upload a file to EFS |
+| `efsrm` | Delete a file or directory from EFS (`-r` for recursive) |
+| `efsstat` | Show EFS file/directory information |
+| `efsmkdir` | Create a directory on EFS |
+| `efschmod` | Change EFS file/directory permissions |
+| `efsln` | Create a symlink on EFS |
+| `efsrl` | Read a symlink target on EFS |
+| `efsdump` | Dump the EFS factory image |
+| `efsbackup` | Backup EFS filesystem to TAR archive |
+| `efsrestore` | Restore EFS filesystem from TAR archive |
+
+**Other:**
+
+| Subcommand | Description |
+|------------|-------------|
+| `list` | List connected EDL, DIAG, and PCIe devices |
 | `ramdump` | Extract RAM dumps via Sahara |
 | `ks` | Keystore/Sahara over serial device nodes |
 
@@ -101,6 +129,7 @@ qfenix prog_firehose_ddr.elf rawprogram*.xml patch*.xml
 | Option | Description |
 |--------|-------------|
 | `-F, --firmware-dir=PATH` | Recursively auto-detect and load firmware from directory |
+| `-e, --erase-all` | Erase all partitions before programming (reads first, then erase, then flash) |
 | `-E, --no-auto-edl` | Disable automatic DIAG to EDL mode switching |
 | `-M, --skip-md5` | Skip MD5 verification of firmware files |
 | `-P, --pcie` | Force PCIe/MHI transport (auto-detected on Linux) |
@@ -180,17 +209,59 @@ qfenix nvwrite 6828 0102030405
 qfenix nvread 0 --serial COM49
 ```
 
-Browse and download files from the modem's EFS filesystem:
+Browse and manage files on the modem's EFS filesystem:
 
 ```bash
 # List EFS root directory
 qfenix efsls /
 
 # Download a file from EFS
-qfenix efsget /nv/item_files/modem/mmode/band_pref.bin ./band_pref.bin
+qfenix efspull /nv/item_files/modem/mmode/band_pref.bin ./band_pref.bin
 
-# Dump factory EFS image
+# Upload a file to EFS
+qfenix efspush ./band_pref.bin /nv/item_files/modem/mmode/band_pref.bin
+
+# Show file information
+qfenix efsstat /nv/item_files/modem/mmode/band_pref.bin
+
+# Create a directory
+qfenix efsmkdir /custapp/mydir
+
+# Change permissions
+qfenix efschmod 0755 /custapp/mydir
+
+# Create a symlink
+qfenix efsln /target/path /link/path
+
+# Read a symlink target
+qfenix efsrl /link/path
+
+# Delete a file
+qfenix efsrm /custapp/mydir/file.bin
+
+# Recursively delete a directory
+qfenix efsrm -r /custapp/mydir
+
+# Dump factory EFS image (binary format)
 qfenix efsdump efs_backup.bin
+```
+
+### EFS backup and restore
+
+Backup and restore the entire EFS filesystem as a standard TAR archive:
+
+```bash
+# Backup EFS to TAR (uses modem's built-in TAR generation)
+qfenix efsbackup -o efs_backup.tar
+
+# Backup a specific EFS subtree
+qfenix efsbackup -o nv_backup.tar /nv/item_files
+
+# Force manual tree walk (if modem TAR generation fails)
+qfenix efsbackup --manual -o efs_backup.tar
+
+# Restore EFS from a TAR archive
+qfenix efsrestore efs_backup.tar
 ```
 
 ### GPT and partition operations
@@ -231,6 +302,18 @@ qfenix read efs2 modem system -L /path/to/firmware/ -o /path/to/backups/
 
 # If -o is omitted, output goes to the loader directory
 qfenix read modem -L /path/to/firmware/
+
+# Erase a specific partition
+qfenix erase efs2 -L /path/to/firmware/
+
+# Erase multiple partitions
+qfenix erase efs2 efs3 modemst1 modemst2 -L /path/to/firmware/
+
+# Erase all partitions on the device
+qfenix eraseall -L /path/to/firmware/
+
+# Flash with erase-all: reads first, then erases everything, then programs
+qfenix flash -e -F /path/to/firmware/
 ```
 
 ### PCIe modem flashing

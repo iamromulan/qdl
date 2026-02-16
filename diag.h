@@ -33,18 +33,33 @@
 #define EFS2_DIAG_STAT		15
 #define EFS2_DIAG_FSTAT		17
 
+/* EFS write/modify commands */
+#define EFS2_DIAG_WRITE		5
+#define EFS2_DIAG_SYMLINK	6
+#define EFS2_DIAG_UNLINK	7
+#define EFS2_DIAG_RMDIR		8
+#define EFS2_DIAG_MKDIR		9
+#define EFS2_DIAG_READLINK	14
+#define EFS2_DIAG_CHMOD		18
+
 /* EFS factory image commands */
 #define EFS2_DIAG_PREP_FACT_IMAGE	25
 #define EFS2_DIAG_FACT_IMAGE_START	22
 #define EFS2_DIAG_FACT_IMAGE_READ	23
 #define EFS2_DIAG_FACT_IMAGE_END	24
 
+/* EFS filesystem image (TAR/ZIP) commands */
+#define EFS2_DIAG_FS_IMAGE_OPEN		54
+#define EFS2_DIAG_FS_IMAGE_READ		55
+#define EFS2_DIAG_FS_IMAGE_CLOSE	56
+
 /* NV item sizes */
 #define NV_ITEM_DATA_SIZE	128
 #define NV_ITEM_PKT_SIZE	(1 + 2 + NV_ITEM_DATA_SIZE + 2)
 
-/* EFS read chunk size */
+/* EFS read/write chunk size */
 #define EFS_MAX_READ_REQ	1024
+#define EFS_MAX_WRITE_REQ	1024
 
 /* NV item status codes */
 #define NV_DONE_S	0
@@ -120,5 +135,21 @@ int diag_efs_listdir(struct diag_session *sess, const char *path,
 int diag_efs_readfile(struct diag_session *sess, const char *src_path,
 		      const char *dst_path);
 int diag_efs_dump(struct diag_session *sess, const char *output_file);
+int diag_efs_backup(struct diag_session *sess, const char *path,
+		    const char *output_file, bool manual);
+int diag_efs_restore(struct diag_session *sess, const char *tar_file);
+int diag_efs_put(struct diag_session *sess, const char *local_path,
+		 const char *efs_path);
+int diag_efs_rm(struct diag_session *sess, const char *path, bool recursive);
+int diag_efs_stat_path(struct diag_session *sess, const char *path,
+		       struct efs_stat *st);
+int diag_efs_mkdir_path(struct diag_session *sess, const char *path,
+			int16_t mode);
+int diag_efs_chmod_path(struct diag_session *sess, const char *path,
+			int16_t mode);
+int diag_efs_ln(struct diag_session *sess, const char *target,
+		const char *linkpath);
+int diag_efs_readlink_path(struct diag_session *sess, const char *path,
+			   char *buf, size_t buf_size);
 
 #endif

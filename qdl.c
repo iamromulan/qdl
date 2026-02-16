@@ -762,6 +762,8 @@ static void print_usage(FILE *out)
 	fprintf(out, "  setslot       Set the active A/B slot (a or b)\n");
 	fprintf(out, "  read          Read partition(s) by label\n");
 	fprintf(out, "  readall       Dump all partitions to files\n");
+	fprintf(out, "  erase         Erase partition(s) by label\n");
+	fprintf(out, "  eraseall      Erase all partitions on device\n");
 
 	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
 		       "\nDIAG Subcommands");
@@ -770,8 +772,17 @@ static void print_usage(FILE *out)
 	fprintf(out, "  nvread        Read an NV item via DIAG\n");
 	fprintf(out, "  nvwrite       Write an NV item via DIAG\n");
 	fprintf(out, "  efsls         List an EFS directory via DIAG\n");
-	fprintf(out, "  efsget        Download a file from EFS via DIAG\n");
-	fprintf(out, "  efsdump       Dump the EFS factory image via DIAG\n");
+	fprintf(out, "  efspull       Download a file from EFS\n");
+	fprintf(out, "  efspush       Upload a file to EFS\n");
+	fprintf(out, "  efsrm         Delete a file or directory from EFS (-r for recursive)\n");
+	fprintf(out, "  efsstat       Show EFS file/directory information\n");
+	fprintf(out, "  efsmkdir      Create a directory on EFS\n");
+	fprintf(out, "  efschmod      Change EFS file/directory permissions\n");
+	fprintf(out, "  efsln         Create a symlink on EFS\n");
+	fprintf(out, "  efsrl         Read a symlink target on EFS\n");
+	fprintf(out, "  efsdump       Dump the EFS factory image\n");
+	fprintf(out, "  efsbackup     Backup EFS filesystem to TAR archive\n");
+	fprintf(out, "  efsrestore    Restore EFS filesystem from TAR archive\n");
 
 	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
 		       "\nOther Subcommands");
@@ -2635,7 +2646,7 @@ static int qdl_efsls(int argc, char **argv)
 	return !!ret;
 }
 
-static int qdl_efsget(int argc, char **argv)
+static int qdl_efspull(int argc, char **argv)
 {
 	struct diag_session *sess;
 	char *serial = NULL;
@@ -2665,7 +2676,7 @@ static int qdl_efsget(int argc, char **argv)
 			break;
 		case 'h':
 		default:
-			fprintf(stderr, "Usage: qfenix efsget <remote_path> <local_path> [--serial=S] [--debug]\n");
+			fprintf(stderr, "Usage: qfenix efspull <remote_path> <local_path> [--serial=S] [--debug]\n");
 			return opt == 'h' ? 0 : 1;
 		}
 	}
@@ -2739,6 +2750,744 @@ static int qdl_efsdump(int argc, char **argv)
 	return !!ret;
 }
 
+static int qdl_efspush(int argc, char **argv)
+{
+	struct diag_session *sess;
+	char *serial = NULL;
+	int opt;
+	int ret;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:h", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 'h':
+		default:
+			fprintf(stderr,
+				"Usage: qfenix efspush <local_file> <efs_path> [--serial=S]\n"
+				"\nUpload a local file to the device EFS filesystem.\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (optind + 1 >= argc) {
+		fprintf(stderr, "Error: requires <local_file> and <efs_path>\n");
+		return 1;
+	}
+
+	sess = diag_open(serial);
+	if (!sess)
+		return 1;
+
+	ret = diag_efs_put(sess, argv[optind], argv[optind + 1]);
+
+	diag_close(sess);
+	return !!ret;
+}
+
+static int qdl_efsrm(int argc, char **argv)
+{
+	struct diag_session *sess;
+	char *serial = NULL;
+	bool recursive = false;
+	int opt;
+	int ret;
+	int i;
+	int failed = 0;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"recursive", no_argument, 0, 'r'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:rh", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 'r':
+			recursive = true;
+			break;
+		case 'h':
+		default:
+			fprintf(stderr,
+				"Usage: qfenix efsrm [-r] <path> [path2 ...] [--serial=S]\n"
+				"\nDelete file(s) or directories from EFS.\n"
+				"\nOptions:\n"
+				"  -r, --recursive   Recursively remove directories\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (optind >= argc) {
+		fprintf(stderr, "Error: no path(s) specified\n");
+		return 1;
+	}
+
+	sess = diag_open(serial);
+	if (!sess)
+		return 1;
+
+	for (i = optind; i < argc; i++) {
+		ret = diag_efs_rm(sess, argv[i], recursive);
+		if (ret)
+			failed++;
+	}
+
+	diag_close(sess);
+	return !!failed;
+}
+
+static const char *mode_string(int32_t mode)
+{
+	static char buf[11];
+
+	buf[0] = S_ISDIR(mode) ? 'd' : S_ISLNK(mode) ? 'l' : '-';
+	buf[1] = (mode & 0400) ? 'r' : '-';
+	buf[2] = (mode & 0200) ? 'w' : '-';
+	buf[3] = (mode & 0100) ? 'x' : '-';
+	buf[4] = (mode & 040) ? 'r' : '-';
+	buf[5] = (mode & 020) ? 'w' : '-';
+	buf[6] = (mode & 010) ? 'x' : '-';
+	buf[7] = (mode & 04) ? 'r' : '-';
+	buf[8] = (mode & 02) ? 'w' : '-';
+	buf[9] = (mode & 01) ? 'x' : '-';
+	buf[10] = '\0';
+
+	return buf;
+}
+
+static int qdl_efsstat(int argc, char **argv)
+{
+	struct diag_session *sess;
+	struct efs_stat st;
+	char *serial = NULL;
+	int opt;
+	int ret;
+	int i;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:h", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 'h':
+		default:
+			fprintf(stderr,
+				"Usage: qfenix efsstat <path> [path2 ...] [--serial=S]\n"
+				"\nShow file/directory information from EFS.\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (optind >= argc) {
+		fprintf(stderr, "Error: no path(s) specified\n");
+		return 1;
+	}
+
+	sess = diag_open(serial);
+	if (!sess)
+		return 1;
+
+	for (i = optind; i < argc; i++) {
+		ret = diag_efs_stat_path(sess, argv[i], &st);
+		if (ret) {
+			ux_err("cannot stat '%s'\n", argv[i]);
+			continue;
+		}
+
+		printf("  File: %s\n", argv[i]);
+		printf("  Size: %-12d  Links: %d\n", st.size, st.nlink);
+		printf("  Mode: %s (0%o)\n", mode_string(st.mode),
+		       st.mode & 07777);
+		printf("  Type: %s\n",
+		       S_ISDIR(st.mode) ? "directory" :
+		       S_ISLNK(st.mode) ? "symlink" :
+		       S_ISREG(st.mode) ? "regular file" : "other");
+		printf(" Atime: %d\n", st.atime);
+		printf(" Mtime: %d\n", st.mtime);
+		printf(" Ctime: %d\n", st.ctime);
+
+		if (i + 1 < argc)
+			printf("\n");
+	}
+
+	diag_close(sess);
+	return 0;
+}
+
+static int qdl_efsmkdir(int argc, char **argv)
+{
+	struct diag_session *sess;
+	char *serial = NULL;
+	int16_t mode = 0755;
+	int opt;
+	int ret;
+	int i;
+	int failed = 0;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"mode", required_argument, 0, 'm'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:m:h", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 'm':
+			mode = (int16_t)strtol(optarg, NULL, 8);
+			break;
+		case 'h':
+		default:
+			fprintf(stderr,
+				"Usage: qfenix efsmkdir [-m mode] <path> [path2 ...] [--serial=S]\n"
+				"\nCreate directories on the EFS filesystem.\n"
+				"\nOptions:\n"
+				"  -m, --mode=MODE   Octal permission mode (default: 0755)\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (optind >= argc) {
+		fprintf(stderr, "Error: no path(s) specified\n");
+		return 1;
+	}
+
+	sess = diag_open(serial);
+	if (!sess)
+		return 1;
+
+	for (i = optind; i < argc; i++) {
+		ret = diag_efs_mkdir_path(sess, argv[i], mode);
+		if (ret) {
+			ux_err("failed to create '%s'\n", argv[i]);
+			failed++;
+		} else {
+			ux_info("created directory '%s'\n", argv[i]);
+		}
+	}
+
+	diag_close(sess);
+	return !!failed;
+}
+
+static int qdl_efschmod(int argc, char **argv)
+{
+	struct diag_session *sess;
+	char *serial = NULL;
+	int16_t mode;
+	int opt;
+	int ret;
+	int i;
+	int failed = 0;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:h", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 'h':
+		default:
+			fprintf(stderr,
+				"Usage: qfenix efschmod <mode> <path> [path2 ...] [--serial=S]\n"
+				"\nChange EFS file/directory permissions.\n"
+				"\n  <mode> is an octal permission value (e.g. 0644, 0755)\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (optind + 1 >= argc) {
+		fprintf(stderr, "Error: requires <mode> and <path>\n");
+		return 1;
+	}
+
+	mode = (int16_t)strtol(argv[optind], NULL, 8);
+
+	sess = diag_open(serial);
+	if (!sess)
+		return 1;
+
+	for (i = optind + 1; i < argc; i++) {
+		ret = diag_efs_chmod_path(sess, argv[i], mode);
+		if (ret) {
+			ux_err("failed to chmod '%s'\n", argv[i]);
+			failed++;
+		} else {
+			ux_info("chmod 0%o '%s'\n", mode & 07777, argv[i]);
+		}
+	}
+
+	diag_close(sess);
+	return !!failed;
+}
+
+static int qdl_efsln(int argc, char **argv)
+{
+	struct diag_session *sess;
+	char *serial = NULL;
+	int opt;
+	int ret;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:h", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 'h':
+		default:
+			fprintf(stderr,
+				"Usage: qfenix efsln <target> <linkpath> [--serial=S]\n"
+				"\nCreate a symlink on the EFS filesystem.\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (optind + 1 >= argc) {
+		fprintf(stderr, "Error: requires <target> and <linkpath>\n");
+		return 1;
+	}
+
+	sess = diag_open(serial);
+	if (!sess)
+		return 1;
+
+	ret = diag_efs_ln(sess, argv[optind], argv[optind + 1]);
+	if (ret == 0)
+		ux_info("symlink '%s' -> '%s'\n",
+			argv[optind + 1], argv[optind]);
+
+	diag_close(sess);
+	return !!ret;
+}
+
+static int qdl_efsrl(int argc, char **argv)
+{
+	struct diag_session *sess;
+	char buf[256];
+	char *serial = NULL;
+	int opt;
+	int ret;
+	int i;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:h", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 'h':
+		default:
+			fprintf(stderr,
+				"Usage: qfenix efsrl <path> [path2 ...] [--serial=S]\n"
+				"\nRead symlink target(s) on the EFS filesystem.\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (optind >= argc) {
+		fprintf(stderr, "Error: no path(s) specified\n");
+		return 1;
+	}
+
+	sess = diag_open(serial);
+	if (!sess)
+		return 1;
+
+	for (i = optind; i < argc; i++) {
+		ret = diag_efs_readlink_path(sess, argv[i], buf, sizeof(buf));
+		if (ret) {
+			ux_err("cannot read link '%s'\n", argv[i]);
+		} else {
+			printf("%s -> %s\n", argv[i], buf);
+		}
+	}
+
+	diag_close(sess);
+	return 0;
+}
+
+static int qdl_efsbackup(int argc, char **argv)
+{
+	struct diag_session *sess;
+	char *serial = NULL;
+	const char *output = "efs_backup.tar";
+	const char *path = "/";
+	bool manual = false;
+	int opt;
+	int ret;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"output", required_argument, 0, 'o'},
+		{"manual", no_argument, 0, 'm'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:o:mh", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 'o':
+			output = optarg;
+			break;
+		case 'm':
+			manual = true;
+			break;
+		case 'h':
+		default:
+			fprintf(stderr,
+				"Usage: qfenix efsbackup [-o output.tar] [--manual] [path] [--serial=S]\n"
+				"\nBackup EFS filesystem to a TAR archive.\n"
+				"\nOptions:\n"
+				"  -o, --output=FILE   Output file (default: efs_backup.tar)\n"
+				"  -m, --manual        Force manual tree walk (skip modem TAR generation)\n"
+				"  -S, --serial=S      Target device by serial/port\n"
+				"  -d, --debug         Print detailed debug info\n"
+				"\nIf [path] is given, only that EFS subtree is backed up (default: /)\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (optind < argc)
+		path = argv[optind];
+
+	sess = diag_open(serial);
+	if (!sess)
+		return 1;
+
+	ret = diag_efs_backup(sess, path, output, manual);
+
+	diag_close(sess);
+	return !!ret;
+}
+
+static int qdl_efsrestore(int argc, char **argv)
+{
+	struct diag_session *sess;
+	char *serial = NULL;
+	int opt;
+	int ret;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:h", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 'h':
+		default:
+			fprintf(stderr,
+				"Usage: qfenix efsrestore <input.tar> [--serial=S]\n"
+				"\nRestore EFS filesystem from a TAR archive.\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (optind >= argc) {
+		fprintf(stderr, "Error: input TAR file required\n");
+		return 1;
+	}
+
+	sess = diag_open(serial);
+	if (!sess)
+		return 1;
+
+	ret = diag_efs_restore(sess, argv[optind]);
+
+	diag_close(sess);
+	return !!ret;
+}
+
+static int qdl_erase(int argc, char **argv)
+{
+	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
+	struct qdl_device *qdl = NULL;
+	char *loader_dir = NULL;
+	char *programmer = NULL;
+	bool storage_set = false;
+	bool use_pcie = false;
+	char *serial = NULL;
+	int opt;
+	int ret;
+	int i;
+	int failed = 0;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"storage", required_argument, 0, 's'},
+		{"find-loader", required_argument, 0, 'L'},
+		{"pcie", no_argument, 0, 'P'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:s:L:Ph", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 's':
+			storage_type = decode_storage(optarg);
+			storage_set = true;
+			break;
+		case 'L':
+			loader_dir = optarg;
+			break;
+		case 'P':
+			use_pcie = true;
+			break;
+		case 'h':
+		default:
+			fprintf(stderr,
+				"Usage: qfenix erase [-L dir | <programmer>] <label> [label2 ...] [--serial=S] [--storage=T] [--pcie]\n"
+				"\nErase one or more partitions by label.\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (optind >= argc) {
+		fprintf(stderr, "Error: no partition label(s) specified\n");
+		return 1;
+	}
+
+	if (!loader_dir && optind + 1 >= argc) {
+		/* Only labels, no programmer — try current dir */
+		loader_dir = ".";
+	}
+
+	if (loader_dir) {
+		programmer = find_programmer_recursive(loader_dir);
+		if (!programmer) {
+			fprintf(stderr, "Error: no programmer found in %s\n", loader_dir);
+			return 1;
+		}
+		if (!storage_set)
+			storage_type = detect_storage_from_directory(loader_dir);
+	}
+
+	ret = firehose_session_open(&qdl,
+				    programmer ? programmer : argv[optind++],
+				    storage_type, serial, use_pcie);
+	if (ret) {
+		free(programmer);
+		return 1;
+	}
+
+	for (i = optind; i < argc; i++) {
+		ret = gpt_erase_partition(qdl, argv[i]);
+		if (ret)
+			failed++;
+	}
+
+	firehose_session_close(qdl, true);
+	free(programmer);
+	return !!failed;
+}
+
+static int qdl_eraseall(int argc, char **argv)
+{
+	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
+	struct qdl_device *qdl = NULL;
+	char *loader_dir = NULL;
+	char *programmer = NULL;
+	bool storage_set = false;
+	bool use_pcie = false;
+	char *serial = NULL;
+	int opt;
+	int ret;
+
+	static struct option options[] = {
+		{"debug", no_argument, 0, 'd'},
+		{"version", no_argument, 0, 'v'},
+		{"serial", required_argument, 0, 'S'},
+		{"storage", required_argument, 0, 's'},
+		{"find-loader", required_argument, 0, 'L'},
+		{"pcie", no_argument, 0, 'P'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
+
+	while ((opt = getopt_long(argc, argv, "dvS:s:L:Ph", options, NULL)) != -1) {
+		switch (opt) {
+		case 'd':
+			qdl_debug = true;
+			break;
+		case 'v':
+			print_version();
+			return 0;
+		case 'S':
+			serial = optarg;
+			break;
+		case 's':
+			storage_type = decode_storage(optarg);
+			storage_set = true;
+			break;
+		case 'L':
+			loader_dir = optarg;
+			break;
+		case 'P':
+			use_pcie = true;
+			break;
+		case 'h':
+		default:
+			fprintf(stderr,
+				"Usage: qfenix eraseall [-L dir | <programmer>] [--serial=S] [--storage=T] [--pcie]\n"
+				"\nErase all partitions on the device.\n");
+			return opt == 'h' ? 0 : 1;
+		}
+	}
+
+	if (!loader_dir && optind >= argc)
+		loader_dir = ".";
+
+	if (loader_dir) {
+		programmer = find_programmer_recursive(loader_dir);
+		if (!programmer) {
+			fprintf(stderr, "Error: no programmer found in %s\n", loader_dir);
+			return 1;
+		}
+		if (!storage_set)
+			storage_type = detect_storage_from_directory(loader_dir);
+	}
+
+	ret = firehose_session_open(&qdl,
+				    programmer ? programmer : argv[optind],
+				    storage_type, serial, use_pcie);
+	if (ret) {
+		free(programmer);
+		return 1;
+	}
+
+	ret = gpt_erase_all_partitions(qdl);
+
+	firehose_session_close(qdl, true);
+	free(programmer);
+	return !!ret;
+}
+
 static int qdl_flash(int argc, char **argv)
 {
 	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
@@ -2759,6 +3508,7 @@ static int qdl_flash(int argc, char **argv)
 	bool allow_fusing = false;
 	bool allow_missing = false;
 	bool storage_type_set = false;
+	bool erase_all = false;
 	long out_chunk_size = 0;
 	unsigned int slot = UINT_MAX;
 	struct qdl_device *qdl = NULL;
@@ -2783,11 +3533,12 @@ static int qdl_flash(int argc, char **argv)
 		{"firmware-dir", required_argument, 0, 'F'},
 		{"find-loader", required_argument, 0, 'L'},
 		{"pcie", no_argument, 0, 'P'},
+		{"erase-all", no_argument, 0, 'e'},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
 
-	while ((opt = getopt_long(argc, argv, "dvi:lu:S:D:s:fcnt:T:EMF:L:Ph", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "dvi:lu:S:D:s:fcnt:T:EMF:L:Peh", options, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			qdl_debug = true;
@@ -2845,6 +3596,9 @@ static int qdl_flash(int argc, char **argv)
 			break;
 		case 'P':
 			qdl_dev_type = QDL_DEVICE_PCIE;
+			break;
+		case 'e':
+			erase_all = true;
 			break;
 		case 'h':
 			print_usage(stdout);
@@ -3097,7 +3851,7 @@ static int qdl_flash(int argc, char **argv)
 	if (ufs_need_provisioning())
 		ret = firehose_provision(qdl);
 	else
-		ret = firehose_run(qdl);
+		ret = firehose_run(qdl, erase_all);
 	if (ret < 0)
 		goto out_cleanup;
 
@@ -3149,16 +3903,38 @@ int main(int argc, char **argv)
 		return qdl_read_partition(argc - 1, argv + 1);
 	if (argc >= 2 && !strcmp(argv[1], "readall"))
 		return qdl_readall(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "erase"))
+		return qdl_erase(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "eraseall"))
+		return qdl_eraseall(argc - 1, argv + 1);
 	if (argc >= 2 && !strcmp(argv[1], "nvread"))
 		return qdl_nvread(argc - 1, argv + 1);
 	if (argc >= 2 && !strcmp(argv[1], "nvwrite"))
 		return qdl_nvwrite(argc - 1, argv + 1);
 	if (argc >= 2 && !strcmp(argv[1], "efsls"))
 		return qdl_efsls(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "efsget"))
-		return qdl_efsget(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "efspull"))
+		return qdl_efspull(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "efspush"))
+		return qdl_efspush(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "efsrm"))
+		return qdl_efsrm(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "efsstat"))
+		return qdl_efsstat(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "efsmkdir"))
+		return qdl_efsmkdir(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "efschmod"))
+		return qdl_efschmod(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "efsln"))
+		return qdl_efsln(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "efsrl"))
+		return qdl_efsrl(argc - 1, argv + 1);
 	if (argc >= 2 && !strcmp(argv[1], "efsdump"))
 		return qdl_efsdump(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "efsbackup"))
+		return qdl_efsbackup(argc - 1, argv + 1);
+	if (argc >= 2 && !strcmp(argv[1], "efsrestore"))
+		return qdl_efsrestore(argc - 1, argv + 1);
 	if (argc >= 2 && !strcmp(argv[1], "flash")) {
 		/*
 		 * "qfenix flash [options] [dir]" — treat bare positional
@@ -3184,6 +3960,7 @@ int main(int argc, char **argv)
 					"  -f, --allow-missing       Allow skipping of missing files\n"
 					"  -M, --skip-md5            Skip MD5 verification\n"
 					"  -E, --no-auto-edl         Disable automatic DIAG to EDL switching\n"
+					"  -e, --erase-all           Erase all partitions before programming\n"
 					"  -P, --pcie                Use PCIe/MHI transport\n"
 					"  -h, --help                Print this help\n");
 				return 0;

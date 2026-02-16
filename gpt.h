@@ -19,5 +19,7 @@ int gpt_read_partition_to_dir(struct qdl_device *qdl, const char *label,
 int gpt_read_full_storage(struct qdl_device *qdl, const char *outfile);
 int gpt_make_xml(struct qdl_device *qdl, const char *outdir,
 		 bool make_read, bool make_program);
+int gpt_erase_partition(struct qdl_device *qdl, const char *label);
+int gpt_erase_all_partitions(struct qdl_device *qdl);
 
 #endif

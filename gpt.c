@@ -133,6 +133,90 @@ static int nand_find_mibib(struct qdl_device *qdl, size_t sector_size)
 }
 
 /*
+ * Load the NAND SMEM partition table: detect sector size, find MIBIB,
+ * read SMEM entries, and get pages_per_block from storage info.
+ * Caller provides ptable and pages_per_block output pointers.
+ * Returns 0 on success, -1 on failure.
+ */
+static int nand_load_ptable(struct qdl_device *qdl,
+			    struct smem_flash_ptable *ptable,
+			    unsigned int *pages_per_block_out)
+{
+	struct storage_info sinfo;
+	uint8_t buf[8192];
+	struct read_op op;
+	size_t sector_size;
+	unsigned int max_parts;
+	unsigned int pages_per_block;
+	char sector_str[16];
+	int mibib_sector;
+	int ret;
+
+	sector_size = qdl->sector_size;
+	if (!sector_size)
+		sector_size = nand_detect_sector_size(qdl);
+	if (!sector_size) {
+		ux_err("failed to detect NAND page size\n");
+		return -1;
+	}
+	qdl->sector_size = sector_size;
+
+	mibib_sector = nand_find_mibib(qdl, sector_size);
+	if (mibib_sector < 0) {
+		ux_err("MIBIB partition table not found\n");
+		return -1;
+	}
+
+	memset(&op, 0, sizeof(op));
+	op.partition = 0;
+	op.num_sectors = 2;
+	op.sector_size = sector_size;
+	snprintf(sector_str, sizeof(sector_str), "%u", mibib_sector + 1);
+	op.start_sector = sector_str;
+
+	memset(buf, 0, sizeof(buf));
+	ret = firehose_read_buf(qdl, &op, buf, sector_size * 2);
+	if (ret) {
+		ux_err("failed to read MIBIB partition table\n");
+		return -1;
+	}
+
+	memcpy(ptable, buf, sizeof(*ptable));
+
+	if (ptable->magic1 != SMEM_FLASH_PART_MAGIC1 ||
+	    ptable->magic2 != SMEM_FLASH_PART_MAGIC2) {
+		ux_err("invalid SMEM partition table magic\n");
+		return -1;
+	}
+
+	if (ptable->version == SMEM_FLASH_PTABLE_V3)
+		max_parts = SMEM_FLASH_PTABLE_MAX_PARTS_V3;
+	else
+		max_parts = SMEM_FLASH_PTABLE_MAX_PARTS_V4;
+
+	if (ptable->numparts > max_parts) {
+		ux_err("SMEM table has %u entries, capping at %u\n",
+		       ptable->numparts, max_parts);
+		ptable->numparts = max_parts;
+	}
+
+	ret = firehose_getstorageinfo(qdl, 0, &sinfo);
+	if (ret || !sinfo.block_size) {
+		ux_err("failed to get NAND block size from storage info\n");
+		return -1;
+	}
+
+	pages_per_block = sinfo.block_size / sector_size;
+	if (!pages_per_block) {
+		ux_err("invalid block_size/page_size ratio\n");
+		return -1;
+	}
+
+	*pages_per_block_out = pages_per_block;
+	return 0;
+}
+
+/*
  * Read and print the NAND partition table from MIBIB.
  */
 static int nand_print_partitions(struct qdl_device *qdl)
@@ -1663,4 +1747,141 @@ int gpt_make_xml(struct qdl_device *qdl, const char *outdir,
 		return nand_make_xml(qdl, outdir, make_read, make_program);
 
 	return gpt_make_xml_from_table(qdl, outdir, make_read, make_program);
+}
+
+static int nand_erase_partition(struct qdl_device *qdl, const char *label)
+{
+	struct smem_flash_ptable ptable;
+	unsigned int pages_per_block;
+	char name[SMEM_FLASH_PTABLE_NAME_SIZE + 1];
+	unsigned int i;
+	int ret;
+
+	ret = nand_load_ptable(qdl, &ptable, &pages_per_block);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < ptable.numparts; i++) {
+		struct smem_flash_pentry *e = &ptable.pentry[i];
+		unsigned int start_pages = e->offset * pages_per_block;
+		unsigned int num_pages = e->length * pages_per_block;
+
+		memcpy(name, e->name, SMEM_FLASH_PTABLE_NAME_SIZE);
+		name[SMEM_FLASH_PTABLE_NAME_SIZE] = '\0';
+
+		const char *display_name = name;
+
+		if (name[0] == '0' && name[1] == ':')
+			display_name = name + 2;
+
+		if (strcmp(display_name, label) != 0)
+			continue;
+
+		ux_info("erasing partition '%s' (%u pages)\n",
+			display_name, num_pages);
+
+		return firehose_erase_partition(qdl, 0, start_pages,
+						num_pages, pages_per_block);
+	}
+
+	ux_err("no partition '%s' found in NAND partition table\n", label);
+	return -1;
+}
+
+static int nand_erase_all_partitions(struct qdl_device *qdl)
+{
+	struct smem_flash_ptable ptable;
+	unsigned int pages_per_block;
+	char name[SMEM_FLASH_PTABLE_NAME_SIZE + 1];
+	unsigned int i;
+	int ret;
+	int count = 0;
+	int failed = 0;
+
+	ret = nand_load_ptable(qdl, &ptable, &pages_per_block);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < ptable.numparts; i++) {
+		struct smem_flash_pentry *e = &ptable.pentry[i];
+		unsigned int start_pages = e->offset * pages_per_block;
+		unsigned int num_pages = e->length * pages_per_block;
+
+		memcpy(name, e->name, SMEM_FLASH_PTABLE_NAME_SIZE);
+		name[SMEM_FLASH_PTABLE_NAME_SIZE] = '\0';
+
+		const char *display_name = name;
+
+		if (name[0] == '0' && name[1] == ':')
+			display_name = name + 2;
+
+		ux_info("erasing partition '%s' (%u pages)\n",
+			display_name, num_pages);
+
+		ret = firehose_erase_partition(qdl, 0, start_pages,
+					       num_pages, pages_per_block);
+		if (ret) {
+			ux_err("failed to erase partition '%s'\n", display_name);
+			failed++;
+		} else {
+			count++;
+		}
+	}
+
+	ux_info("erased %d partitions (%d failed)\n", count, failed);
+	return failed ? -1 : 0;
+}
+
+int gpt_erase_partition(struct qdl_device *qdl, const char *label)
+{
+	int phys_partition = -1;
+	unsigned int start_sector;
+	unsigned int num_sectors;
+	int ret;
+
+	if (qdl->storage_type == QDL_STORAGE_NAND)
+		return nand_erase_partition(qdl, label);
+
+	ret = gpt_find_by_name(qdl, label, &phys_partition,
+			       &start_sector, &num_sectors);
+	if (ret < 0)
+		return -1;
+
+	ux_info("erasing partition '%s' (%u sectors)\n", label, num_sectors);
+
+	return firehose_erase_partition(qdl, phys_partition, start_sector,
+					num_sectors, 0);
+}
+
+int gpt_erase_all_partitions(struct qdl_device *qdl)
+{
+	struct gpt_partition *part;
+	int ret;
+	int count = 0;
+	int failed = 0;
+
+	if (qdl->storage_type == QDL_STORAGE_NAND)
+		return nand_erase_all_partitions(qdl);
+
+	ret = gpt_load_tables(qdl);
+	if (ret < 0)
+		return -1;
+
+	for (part = gpt_partitions; part; part = part->next) {
+		ux_info("erasing partition '%s' (%u sectors)\n",
+			part->name, part->num_sectors);
+
+		ret = firehose_erase_partition(qdl, part->partition,
+					       part->start_sector,
+					       part->num_sectors, 0);
+		if (ret) {
+			ux_err("failed to erase partition '%s'\n", part->name);
+			failed++;
+		} else {
+			count++;
+		}
+	}
+
+	ux_info("erased %d partitions (%d failed)\n", count, failed);
+	return failed ? -1 : 0;
 }

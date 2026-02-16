@@ -13,6 +13,7 @@
 #include "hdlc.h"
 #include "usb_ids.h"
 #include "qdl.h"
+#include "oscompat.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -1121,7 +1122,7 @@ int diag_efs_readfile(struct diag_session *sess, const char *src_path,
 		return -1;
 	}
 
-	fd = open(dst_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	fd = open(dst_path, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
 	if (fd < 0) {
 		ux_err("cannot create %s: %s\n", dst_path, strerror(errno));
 		efs_close(sess, fdata);
@@ -1174,7 +1175,7 @@ int diag_efs_dump(struct diag_session *sess, const char *output_file)
 			return n;
 	}
 
-	fd = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	fd = open(output_file, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
 	if (fd < 0) {
 		ux_err("cannot create %s: %s\n", output_file, strerror(errno));
 		return -1;
@@ -1240,4 +1241,1066 @@ int diag_efs_dump(struct diag_session *sess, const char *output_file)
 out:
 	close(fd);
 	return ret;
+}
+
+/*
+ * EFS write operations for efsrestore
+ */
+
+static int efs_write(struct diag_session *sess, int32_t fdata,
+		     uint32_t offset, const uint8_t *data, uint32_t len)
+{
+	uint8_t cmd[4 + 4 + 4 + 4 + EFS_MAX_WRITE_REQ];
+	uint8_t resp[64];
+	int32_t bytes_written;
+	int32_t diag_errno;
+	int n;
+
+	if (len > EFS_MAX_WRITE_REQ)
+		len = EFS_MAX_WRITE_REQ;
+
+	memset(cmd, 0, 16);
+	efs_cmd_header(cmd, sess->efs_method, EFS2_DIAG_WRITE);
+	memcpy(&cmd[4], &fdata, 4);
+	memcpy(&cmd[8], &offset, 4);
+	memcpy(&cmd[12], &len, 4);
+	memcpy(&cmd[16], data, len);
+
+	n = diag_send(sess, cmd, 16 + len, resp, sizeof(resp));
+	if (n < 20)
+		return -1;
+
+	memcpy(&bytes_written, &resp[12], 4);
+	memcpy(&diag_errno, &resp[16], 4);
+
+	if (diag_errno != 0 || bytes_written < 0)
+		return -1;
+
+	return bytes_written;
+}
+
+static int efs_mkdir_op(struct diag_session *sess, const char *path,
+			int16_t mode)
+{
+	uint8_t cmd[4 + 2 + 256];
+	uint8_t resp[64];
+	size_t path_len;
+	int32_t diag_errno;
+	int n;
+
+	path_len = strlen(path) + 1;
+	if (path_len > 252)
+		return -1;
+
+	memset(cmd, 0, sizeof(cmd));
+	efs_cmd_header(cmd, sess->efs_method, EFS2_DIAG_MKDIR);
+	memcpy(&cmd[4], &mode, 2);
+	memcpy(&cmd[6], path, path_len);
+
+	n = diag_send(sess, cmd, 6 + path_len, resp, sizeof(resp));
+	if (n < 8)
+		return -1;
+
+	memcpy(&diag_errno, &resp[4], 4);
+
+	/* EEXIST is OK for directories */
+	if (diag_errno != 0 && diag_errno != 17)
+		return -1;
+
+	return 0;
+}
+
+static int efs_symlink_op(struct diag_session *sess, const char *target,
+			  const char *linkpath)
+{
+	uint8_t cmd[4 + 512];
+	uint8_t resp[64];
+	size_t tgt_len, link_len;
+	int32_t diag_errno;
+	int n;
+
+	tgt_len = strlen(target) + 1;
+	link_len = strlen(linkpath) + 1;
+	if (tgt_len + link_len > 508)
+		return -1;
+
+	memset(cmd, 0, sizeof(cmd));
+	efs_cmd_header(cmd, sess->efs_method, EFS2_DIAG_SYMLINK);
+	memcpy(&cmd[4], target, tgt_len);
+	memcpy(&cmd[4 + tgt_len], linkpath, link_len);
+
+	n = diag_send(sess, cmd, 4 + tgt_len + link_len, resp, sizeof(resp));
+	if (n < 8)
+		return -1;
+
+	memcpy(&diag_errno, &resp[4], 4);
+	if (diag_errno != 0)
+		return -1;
+
+	return 0;
+}
+
+static int efs_chmod_op(struct diag_session *sess, const char *path,
+			int16_t mode)
+{
+	uint8_t cmd[4 + 2 + 256];
+	uint8_t resp[64];
+	size_t path_len;
+	int32_t diag_errno;
+	int n;
+
+	path_len = strlen(path) + 1;
+	if (path_len > 252)
+		return -1;
+
+	memset(cmd, 0, sizeof(cmd));
+	efs_cmd_header(cmd, sess->efs_method, EFS2_DIAG_CHMOD);
+	memcpy(&cmd[4], &mode, 2);
+	memcpy(&cmd[6], path, path_len);
+
+	n = diag_send(sess, cmd, 6 + path_len, resp, sizeof(resp));
+	if (n < 8)
+		return -1;
+
+	memcpy(&diag_errno, &resp[4], 4);
+	if (diag_errno != 0)
+		return -1;
+
+	return 0;
+}
+
+static int efs_readlink(struct diag_session *sess, const char *path,
+			char *buf, size_t buf_size)
+{
+	uint8_t cmd[4 + 256];
+	uint8_t resp[512];
+	size_t path_len;
+	int32_t diag_errno;
+	int n;
+
+	path_len = strlen(path) + 1;
+	if (path_len > 252)
+		return -1;
+
+	memset(cmd, 0, sizeof(cmd));
+	efs_cmd_header(cmd, sess->efs_method, EFS2_DIAG_READLINK);
+	memcpy(&cmd[4], path, path_len);
+
+	n = diag_send(sess, cmd, 4 + path_len, resp, sizeof(resp));
+	if (n < 8)
+		return -1;
+
+	memcpy(&diag_errno, &resp[4], 4);
+	if (diag_errno != 0)
+		return -1;
+
+	/* Target string follows at resp[8] */
+	if (n > 8) {
+		size_t tgt_len = n - 8;
+
+		if (tgt_len >= buf_size)
+			tgt_len = buf_size - 1;
+		memcpy(buf, &resp[8], tgt_len);
+		buf[tgt_len] = '\0';
+	} else {
+		buf[0] = '\0';
+	}
+
+	return 0;
+}
+
+/*
+ * FS_IMAGE protocol — modem-generated TAR backup
+ */
+
+static int efs_image_open(struct diag_session *sess, const char *path,
+			  int *handle_out)
+{
+	uint8_t cmd[4 + 2 + 1 + 256];
+	uint8_t resp[64];
+	size_t path_len;
+	uint16_t seq = 0;
+	uint8_t image_type = 0; /* 0 = TAR */
+	int32_t handle;
+	int32_t diag_errno;
+	int n;
+
+	path_len = strlen(path) + 1;
+	if (path_len > 250)
+		return -1;
+
+	memset(cmd, 0, sizeof(cmd));
+	efs_cmd_header(cmd, sess->efs_method, EFS2_DIAG_FS_IMAGE_OPEN);
+	memcpy(&cmd[4], &seq, 2);
+	cmd[6] = image_type;
+	memcpy(&cmd[7], path, path_len);
+
+	n = diag_send(sess, cmd, 7 + path_len, resp, sizeof(resp));
+	if (n < 12)
+		return -1;
+
+	memcpy(&handle, &resp[4], 4);
+	memcpy(&diag_errno, &resp[8], 4);
+
+	if (handle < 0 || diag_errno != 0) {
+		ux_err("EFS image open failed (handle=%d, errno=%d)\n",
+		       handle, diag_errno);
+		return -1;
+	}
+
+	*handle_out = handle;
+	return 0;
+}
+
+static int efs_image_read(struct diag_session *sess, int32_t handle,
+			  uint16_t seq, uint8_t *buf, size_t buf_size,
+			  size_t *bytes_out, bool *end_out)
+{
+	uint8_t cmd[10];
+	uint8_t resp[2048];
+	int32_t diag_errno;
+	uint8_t end_flag;
+	int n;
+
+	memset(cmd, 0, sizeof(cmd));
+	efs_cmd_header(cmd, sess->efs_method, EFS2_DIAG_FS_IMAGE_READ);
+	memcpy(&cmd[4], &handle, 4);
+	memcpy(&cmd[8], &seq, 2);
+
+	n = diag_send(sess, cmd, sizeof(cmd), resp, sizeof(resp));
+	if (n < 15)
+		return -1;
+
+	memcpy(&diag_errno, &resp[10], 4);
+	end_flag = resp[14];
+
+	if (diag_errno != 0) {
+		ux_err("EFS image read failed (errno=%d)\n", diag_errno);
+		return -1;
+	}
+
+	*end_out = (end_flag != 0);
+
+	if (n > 15) {
+		size_t data_len = n - 15;
+
+		if (data_len > buf_size)
+			data_len = buf_size;
+		memcpy(buf, &resp[15], data_len);
+		*bytes_out = data_len;
+	} else {
+		*bytes_out = 0;
+	}
+
+	return 0;
+}
+
+static void efs_image_close(struct diag_session *sess, int32_t handle)
+{
+	uint8_t cmd[8];
+	uint8_t resp[64];
+
+	memset(cmd, 0, sizeof(cmd));
+	efs_cmd_header(cmd, sess->efs_method, EFS2_DIAG_FS_IMAGE_CLOSE);
+	memcpy(&cmd[4], &handle, 4);
+
+	diag_send(sess, cmd, sizeof(cmd), resp, sizeof(resp));
+}
+
+/*
+ * TAR helpers — POSIX ustar format (512-byte headers)
+ */
+
+static void tar_write_octal(char *buf, size_t size, unsigned long value)
+{
+	int width = (int)(size - 1);
+	int n = snprintf(buf, size, "%0*lo", width, value);
+
+	/* If value doesn't fit, truncate to field size */
+	if (n >= (int)size)
+		buf[size - 1] = '\0';
+}
+
+static unsigned int tar_checksum(const uint8_t *header)
+{
+	unsigned int sum = 0;
+	int i;
+
+	for (i = 0; i < 512; i++) {
+		/* Checksum field (offset 148-155) treated as spaces */
+		if (i >= 148 && i < 156)
+			sum += ' ';
+		else
+			sum += header[i];
+	}
+
+	return sum;
+}
+
+static int tar_write_header(int fd, const char *name, int32_t mode,
+			    int32_t size, int32_t mtime, char typeflag,
+			    const char *linkname)
+{
+	uint8_t header[512];
+
+	memset(header, 0, sizeof(header));
+
+	/* name (offset 0, 100 bytes) */
+	strncpy((char *)header, name, 99);
+
+	/* mode (offset 100, 8 bytes) */
+	tar_write_octal((char *)header + 100, 8, mode & 07777);
+
+	/* uid (offset 108, 8 bytes) — use 0 */
+	tar_write_octal((char *)header + 108, 8, 0);
+
+	/* gid (offset 116, 8 bytes) — use 0 */
+	tar_write_octal((char *)header + 116, 8, 0);
+
+	/* size (offset 124, 12 bytes) */
+	tar_write_octal((char *)header + 124, 12,
+			typeflag == '0' ? (unsigned long)size : 0);
+
+	/* mtime (offset 136, 12 bytes) */
+	tar_write_octal((char *)header + 136, 12, (unsigned long)mtime);
+
+	/* typeflag (offset 156) */
+	header[156] = typeflag;
+
+	/* linkname (offset 157, 100 bytes) */
+	if (linkname)
+		strncpy((char *)header + 157, linkname, 99);
+
+	/* magic (offset 257, 6 bytes) + version (offset 263, 2 bytes) */
+	memcpy(header + 257, "ustar", 5);
+	header[263] = '0';
+	header[264] = '0';
+
+	/* checksum (offset 148, 8 bytes) */
+	tar_write_octal((char *)header + 148, 7, tar_checksum(header));
+	header[155] = ' ';
+
+	if (write(fd, header, 512) != 512)
+		return -1;
+
+	return 0;
+}
+
+static unsigned long tar_parse_octal(const char *buf, size_t size)
+{
+	unsigned long val = 0;
+	size_t i;
+
+	for (i = 0; i < size && buf[i]; i++) {
+		if (buf[i] >= '0' && buf[i] <= '7')
+			val = (val << 3) | (buf[i] - '0');
+	}
+
+	return val;
+}
+
+static bool tar_checksum_valid(const uint8_t *header)
+{
+	unsigned int stored;
+
+	stored = (unsigned int)tar_parse_octal((char *)header + 148, 8);
+	return tar_checksum(header) == stored;
+}
+
+/*
+ * Recursive EFS tree walk — manual TAR backup
+ */
+
+static int efs_backup_tree(struct diag_session *sess, const char *path, int fd)
+{
+	struct efs_dirent entry;
+	struct efs_stat st;
+	char fullpath[512];
+	char linkbuf[256];
+	int32_t dirp;
+	uint32_t seqno = 1;
+	int ret;
+
+	dirp = efs_opendir(sess, path);
+	if (dirp < 0) {
+		ux_err("cannot open EFS directory '%s'\n", path);
+		return -1;
+	}
+
+	/* Write directory header (skip for root "/") */
+	if (strcmp(path, "/") != 0) {
+		if (efs_stat(sess, path, &st) == 0) {
+			/* Ensure trailing slash for directory names in TAR */
+			snprintf(fullpath, sizeof(fullpath), "%s/",
+				 path[0] == '/' ? path + 1 : path);
+			tar_write_header(fd, fullpath, st.mode, 0,
+					 st.mtime, '5', NULL);
+		}
+	}
+
+	for (;;) {
+		ret = efs_readdir(sess, dirp, seqno, &entry);
+		if (ret != 0)
+			break;
+
+		/* Skip . and .. */
+		if (!strcmp(entry.name, ".") || !strcmp(entry.name, "..")) {
+			seqno++;
+			continue;
+		}
+
+		if (strcmp(path, "/") == 0)
+			snprintf(fullpath, sizeof(fullpath), "/%s", entry.name);
+		else
+			snprintf(fullpath, sizeof(fullpath), "%s/%s",
+				 path, entry.name);
+
+		if (efs_stat(sess, fullpath, &st) < 0) {
+			ux_warn("cannot stat '%s', skipping\n", fullpath);
+			seqno++;
+			continue;
+		}
+
+		/* Strip leading '/' for TAR path */
+		const char *tar_path = fullpath[0] == '/' ?
+				       fullpath + 1 : fullpath;
+
+		if (S_ISDIR(st.mode)) {
+			/* Recurse into subdirectory */
+			ret = efs_backup_tree(sess, fullpath, fd);
+			if (ret < 0) {
+				ux_warn("failed to backup directory '%s'\n",
+					fullpath);
+			}
+		} else if (S_ISLNK(st.mode)) {
+			/* Read symlink target and write header */
+			if (efs_readlink(sess, fullpath, linkbuf,
+					 sizeof(linkbuf)) == 0) {
+				tar_write_header(fd, tar_path, st.mode,
+						 0, st.mtime, '2', linkbuf);
+			}
+		} else if (S_ISREG(st.mode)) {
+			/* Write file header + data */
+			tar_write_header(fd, tar_path, st.mode, st.size,
+					 st.mtime, '0', NULL);
+
+			/* Read file contents */
+			int32_t fdata = efs_open(sess, fullpath,
+						 0 /* O_RDONLY */, 0);
+			if (fdata >= 0) {
+				uint8_t buf[EFS_MAX_READ_REQ];
+				uint32_t offset = 0;
+				int32_t remaining = st.size;
+
+				while (remaining > 0) {
+					uint32_t chunk = remaining >
+							 EFS_MAX_READ_REQ ?
+							 EFS_MAX_READ_REQ :
+							 remaining;
+					int n = efs_read(sess, fdata, chunk,
+							 offset, buf,
+							 sizeof(buf));
+					if (n <= 0)
+						break;
+
+					if (write(fd, buf, n) != n)
+						break;
+
+					offset += n;
+					remaining -= n;
+				}
+				efs_close(sess, fdata);
+
+				/* Pad to 512-byte boundary */
+				if (st.size % 512) {
+					uint8_t pad[512] = {0};
+					int pad_len = 512 - (st.size % 512);
+
+					if (write(fd, pad, pad_len) != pad_len)
+						ux_warn("TAR pad write failed\n");
+				}
+			}
+		}
+
+		seqno++;
+	}
+
+	efs_closedir(sess, dirp);
+	return 0;
+}
+
+int diag_efs_backup(struct diag_session *sess, const char *path,
+		    const char *output_file, bool manual)
+{
+	int fd;
+	int handle;
+	int ret = -1;
+	int n;
+
+	if (!sess->efs_detected) {
+		n = diag_efs_detect(sess);
+		if (n)
+			return n;
+	}
+
+	fd = open(output_file, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
+	if (fd < 0) {
+		ux_err("cannot create %s: %s\n", output_file, strerror(errno));
+		return -1;
+	}
+
+	if (!manual) {
+		/* Try FS_IMAGE (modem-generated TAR) first */
+		if (efs_image_open(sess, path, &handle) == 0) {
+			uint8_t buf[2048];
+			uint16_t seq = 0;
+			size_t bytes;
+			bool end;
+
+			ux_info("backing up EFS '%s' via FS_IMAGE to %s\n",
+				path, output_file);
+
+			for (;;) {
+				ret = efs_image_read(sess, handle, seq,
+						     buf, sizeof(buf),
+						     &bytes, &end);
+				if (ret < 0)
+					break;
+
+				if (bytes > 0 && write(fd, buf, bytes) !=
+				    (ssize_t)bytes) {
+					ux_err("write failed: %s\n",
+					       strerror(errno));
+					ret = -1;
+					break;
+				}
+
+				if (end) {
+					ret = 0;
+					break;
+				}
+
+				seq++;
+			}
+
+			efs_image_close(sess, handle);
+
+			if (ret == 0) {
+				ux_info("EFS backup complete: %s\n",
+					output_file);
+				close(fd);
+				return 0;
+			}
+
+			ux_warn("FS_IMAGE failed, falling back to manual tree walk\n");
+			/* Truncate and retry with manual method */
+			if (ftruncate(fd, 0) < 0)
+				ux_warn("ftruncate failed: %s\n",
+					strerror(errno));
+			lseek(fd, 0, SEEK_SET);
+		} else {
+			ux_info("FS_IMAGE not supported, using manual tree walk\n");
+		}
+	}
+
+	/* Manual tree walk */
+	ux_info("backing up EFS '%s' via tree walk to %s\n", path, output_file);
+
+	ret = efs_backup_tree(sess, path, fd);
+
+	/* Write two zero blocks to end the TAR archive */
+	if (ret == 0) {
+		uint8_t zeros[1024] = {0};
+
+		if (write(fd, zeros, 1024) != 1024)
+			ret = -1;
+	}
+
+	if (ret == 0)
+		ux_info("EFS backup complete: %s\n", output_file);
+	else
+		ux_err("EFS backup failed\n");
+
+	close(fd);
+	return ret;
+}
+
+int diag_efs_restore(struct diag_session *sess, const char *tar_file)
+{
+	uint8_t header[512];
+	uint8_t data[EFS_MAX_WRITE_REQ];
+	char name[101];
+	char linkname[101];
+	unsigned long mode;
+	unsigned long size;
+	unsigned long mtime;
+	char typeflag;
+	char efs_path[256];
+	int fd;
+	int n;
+	int ret = 0;
+	int files_restored = 0;
+	int dirs_created = 0;
+	int links_created = 0;
+
+	if (!sess->efs_detected) {
+		n = diag_efs_detect(sess);
+		if (n)
+			return n;
+	}
+
+	fd = open(tar_file, O_RDONLY | O_BINARY);
+	if (fd < 0) {
+		ux_err("cannot open %s: %s\n", tar_file, strerror(errno));
+		return -1;
+	}
+
+	ux_info("restoring EFS from %s\n", tar_file);
+
+	while (read(fd, header, 512) == 512) {
+		/* Two consecutive zero blocks = end of archive */
+		bool all_zero = true;
+		int i;
+
+		for (i = 0; i < 512; i++) {
+			if (header[i] != 0) {
+				all_zero = false;
+				break;
+			}
+		}
+		if (all_zero)
+			break;
+
+		if (!tar_checksum_valid(header)) {
+			ux_err("invalid TAR header checksum\n");
+			ret = -1;
+			break;
+		}
+
+		/* Parse header fields */
+		memset(name, 0, sizeof(name));
+		memcpy(name, header, 100);
+
+		mode = tar_parse_octal((char *)header + 100, 8);
+		size = tar_parse_octal((char *)header + 124, 12);
+		mtime = tar_parse_octal((char *)header + 136, 12);
+		(void)mtime; /* preserved in TAR but not settable via DIAG */
+		typeflag = header[156];
+
+		memset(linkname, 0, sizeof(linkname));
+		memcpy(linkname, header + 157, 100);
+
+		/* Strip trailing slashes from directory names */
+		size_t nlen = strlen(name);
+
+		while (nlen > 1 && name[nlen - 1] == '/')
+			name[--nlen] = '\0';
+
+		/* Build EFS path — ensure leading / */
+		if (name[0] == '/')
+			snprintf(efs_path, sizeof(efs_path), "%s", name);
+		else
+			snprintf(efs_path, sizeof(efs_path), "/%s", name);
+
+		switch (typeflag) {
+		case '5': /* Directory */
+			if (efs_mkdir_op(sess, efs_path, (int16_t)mode) == 0) {
+				dirs_created++;
+				ux_debug("mkdir %s\n", efs_path);
+			} else {
+				ux_warn("failed to create directory '%s'\n",
+					efs_path);
+			}
+			break;
+
+		case '0': /* Regular file */
+		case '\0': /* Regular file (old TAR) */
+		{
+			/* EFS oflag: O_CREAT|O_WRONLY|O_TRUNC = 0x301 */
+			int32_t fdata = efs_open(sess, efs_path, 0x301,
+						 (int32_t)mode);
+			if (fdata < 0) {
+				ux_warn("failed to create file '%s'\n",
+					efs_path);
+				/* Skip data blocks */
+				unsigned long blocks = (size + 511) / 512;
+
+				lseek(fd, blocks * 512, SEEK_CUR);
+				break;
+			}
+
+			uint32_t offset = 0;
+			unsigned long remaining = size;
+
+			while (remaining > 0) {
+				uint32_t chunk = remaining > EFS_MAX_WRITE_REQ ?
+						 EFS_MAX_WRITE_REQ : remaining;
+				ssize_t r = read(fd, data, chunk);
+
+				if (r <= 0) {
+					ux_err("read from TAR failed\n");
+					ret = -1;
+					break;
+				}
+
+				int w = efs_write(sess, fdata, offset,
+						  data, (uint32_t)r);
+				if (w < 0) {
+					ux_err("EFS write failed at offset %u\n",
+					       offset);
+					ret = -1;
+					break;
+				}
+
+				offset += w;
+				remaining -= w;
+
+				/* If short write, adjust file position */
+				if ((uint32_t)w < (uint32_t)r)
+					lseek(fd, (off_t)w - r, SEEK_CUR);
+			}
+
+			efs_close(sess, fdata);
+			efs_chmod_op(sess, efs_path, (int16_t)mode);
+
+			/* Skip to next 512-byte TAR boundary */
+			{
+				unsigned long tar_blocks = (size + 511) / 512;
+				unsigned long consumed = size - remaining;
+				long to_skip = (long)(tar_blocks * 512 -
+						      consumed);
+
+				if (to_skip > 0)
+					lseek(fd, to_skip, SEEK_CUR);
+			}
+
+			if (ret == 0) {
+				files_restored++;
+				ux_debug("restored %s (%lu bytes)\n",
+					 efs_path, size);
+			} else {
+				break;
+			}
+			break;
+		}
+
+		case '2': /* Symlink */
+			if (efs_symlink_op(sess, linkname, efs_path) == 0) {
+				links_created++;
+				ux_debug("symlink %s -> %s\n",
+					 efs_path, linkname);
+			} else {
+				ux_warn("failed to create symlink '%s'\n",
+					efs_path);
+			}
+			break;
+
+		default:
+			/* Skip unknown types */
+			if (size > 0) {
+				unsigned long blocks = (size + 511) / 512;
+
+				lseek(fd, blocks * 512, SEEK_CUR);
+			}
+			break;
+		}
+
+		if (ret)
+			break;
+	}
+
+	close(fd);
+
+	if (ret == 0)
+		ux_info("EFS restore complete: %d files, %d dirs, %d symlinks\n",
+			files_restored, dirs_created, links_created);
+	else
+		ux_err("EFS restore failed\n");
+
+	return ret;
+}
+
+/*
+ * EFS file operation subcommands
+ */
+
+static int efs_unlink(struct diag_session *sess, const char *path)
+{
+	uint8_t cmd[4 + 256];
+	uint8_t resp[64];
+	size_t path_len;
+	int32_t diag_errno;
+	int n;
+
+	path_len = strlen(path) + 1;
+	if (path_len > 252)
+		return -1;
+
+	memset(cmd, 0, sizeof(cmd));
+	efs_cmd_header(cmd, sess->efs_method, EFS2_DIAG_UNLINK);
+	memcpy(&cmd[4], path, path_len);
+
+	n = diag_send(sess, cmd, 4 + path_len, resp, sizeof(resp));
+	if (n < 8)
+		return -1;
+
+	memcpy(&diag_errno, &resp[4], 4);
+	if (diag_errno != 0) {
+		ux_err("EFS unlink '%s' failed (errno=%d)\n", path, diag_errno);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int efs_rmdir_op(struct diag_session *sess, const char *path)
+{
+	uint8_t cmd[4 + 256];
+	uint8_t resp[64];
+	size_t path_len;
+	int32_t diag_errno;
+	int n;
+
+	path_len = strlen(path) + 1;
+	if (path_len > 252)
+		return -1;
+
+	memset(cmd, 0, sizeof(cmd));
+	efs_cmd_header(cmd, sess->efs_method, EFS2_DIAG_RMDIR);
+	memcpy(&cmd[4], path, path_len);
+
+	n = diag_send(sess, cmd, 4 + path_len, resp, sizeof(resp));
+	if (n < 8)
+		return -1;
+
+	memcpy(&diag_errno, &resp[4], 4);
+	if (diag_errno != 0) {
+		ux_err("EFS rmdir '%s' failed (errno=%d)\n", path, diag_errno);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int efs_rm_recursive(struct diag_session *sess, const char *path)
+{
+	struct efs_dirent entry;
+	struct efs_stat st;
+	char fullpath[512];
+	int32_t dirp;
+	uint32_t seqno = 1;
+	int ret;
+
+	dirp = efs_opendir(sess, path);
+	if (dirp < 0)
+		return efs_unlink(sess, path);
+
+	for (;;) {
+		ret = efs_readdir(sess, dirp, seqno, &entry);
+		if (ret != 0)
+			break;
+
+		if (!strcmp(entry.name, ".") || !strcmp(entry.name, "..")) {
+			seqno++;
+			continue;
+		}
+
+		if (strcmp(path, "/") == 0)
+			snprintf(fullpath, sizeof(fullpath), "/%s", entry.name);
+		else
+			snprintf(fullpath, sizeof(fullpath), "%s/%s",
+				 path, entry.name);
+
+		if (efs_stat(sess, fullpath, &st) < 0) {
+			seqno++;
+			continue;
+		}
+
+		if (S_ISDIR(st.mode)) {
+			ret = efs_rm_recursive(sess, fullpath);
+			if (ret)
+				ux_warn("failed to remove '%s'\n", fullpath);
+		} else {
+			ret = efs_unlink(sess, fullpath);
+			if (ret)
+				ux_warn("failed to unlink '%s'\n", fullpath);
+			else
+				ux_debug("removed %s\n", fullpath);
+		}
+
+		seqno++;
+	}
+
+	efs_closedir(sess, dirp);
+
+	ret = efs_rmdir_op(sess, path);
+	if (ret == 0)
+		ux_debug("removed directory %s\n", path);
+
+	return ret;
+}
+
+int diag_efs_put(struct diag_session *sess, const char *local_path,
+		 const char *efs_path)
+{
+	struct stat sb;
+	uint8_t buf[EFS_MAX_WRITE_REQ];
+	int32_t fdata;
+	uint32_t offset = 0;
+	int local_fd;
+	int n;
+	int ret = -1;
+
+	if (!sess->efs_detected) {
+		n = diag_efs_detect(sess);
+		if (n)
+			return n;
+	}
+
+	local_fd = open(local_path, O_RDONLY | O_BINARY);
+	if (local_fd < 0) {
+		ux_err("cannot open %s: %s\n", local_path, strerror(errno));
+		return -1;
+	}
+
+	if (fstat(local_fd, &sb) < 0) {
+		ux_err("cannot stat %s: %s\n", local_path, strerror(errno));
+		close(local_fd);
+		return -1;
+	}
+
+	/* EFS oflag: O_CREAT|O_WRONLY|O_TRUNC = 0x301 */
+	fdata = efs_open(sess, efs_path, 0x301, 0644);
+	if (fdata < 0) {
+		ux_err("cannot create EFS file '%s'\n", efs_path);
+		close(local_fd);
+		return -1;
+	}
+
+	ux_info("writing '%s' to EFS '%s' (%ld bytes)\n",
+		local_path, efs_path, (long)sb.st_size);
+
+	while (offset < (uint32_t)sb.st_size) {
+		uint32_t chunk = (uint32_t)sb.st_size - offset;
+
+		if (chunk > EFS_MAX_WRITE_REQ)
+			chunk = EFS_MAX_WRITE_REQ;
+
+		ssize_t r = read(local_fd, buf, chunk);
+
+		if (r <= 0) {
+			ux_err("read from '%s' failed\n", local_path);
+			goto out;
+		}
+
+		int w = efs_write(sess, fdata, offset, buf, (uint32_t)r);
+
+		if (w < 0) {
+			ux_err("EFS write failed at offset %u\n", offset);
+			goto out;
+		}
+
+		offset += w;
+	}
+
+	ux_info("EFS file '%s' written (%u bytes)\n", efs_path, offset);
+	ret = 0;
+
+out:
+	efs_close(sess, fdata);
+	close(local_fd);
+	return ret;
+}
+
+int diag_efs_rm(struct diag_session *sess, const char *path, bool recursive)
+{
+	struct efs_stat st;
+	int n;
+
+	if (!sess->efs_detected) {
+		n = diag_efs_detect(sess);
+		if (n)
+			return n;
+	}
+
+	if (recursive) {
+		if (efs_stat(sess, path, &st) == 0 && S_ISDIR(st.mode))
+			return efs_rm_recursive(sess, path);
+	}
+
+	n = efs_unlink(sess, path);
+	if (n == 0)
+		ux_info("removed '%s'\n", path);
+
+	return n;
+}
+
+int diag_efs_stat_path(struct diag_session *sess, const char *path,
+		       struct efs_stat *st)
+{
+	int n;
+
+	if (!sess->efs_detected) {
+		n = diag_efs_detect(sess);
+		if (n)
+			return n;
+	}
+
+	return efs_stat(sess, path, st);
+}
+
+int diag_efs_mkdir_path(struct diag_session *sess, const char *path,
+			int16_t mode)
+{
+	int n;
+
+	if (!sess->efs_detected) {
+		n = diag_efs_detect(sess);
+		if (n)
+			return n;
+	}
+
+	return efs_mkdir_op(sess, path, mode);
+}
+
+int diag_efs_chmod_path(struct diag_session *sess, const char *path,
+			int16_t mode)
+{
+	int n;
+
+	if (!sess->efs_detected) {
+		n = diag_efs_detect(sess);
+		if (n)
+			return n;
+	}
+
+	return efs_chmod_op(sess, path, mode);
+}
+
+int diag_efs_ln(struct diag_session *sess, const char *target,
+		const char *linkpath)
+{
+	int n;
+
+	if (!sess->efs_detected) {
+		n = diag_efs_detect(sess);
+		if (n)
+			return n;
+	}
+
+	return efs_symlink_op(sess, target, linkpath);
+}
+
+int diag_efs_readlink_path(struct diag_session *sess, const char *path,
+			   char *buf, size_t buf_size)
+{
+	int n;
+
+	if (!sess->efs_detected) {
+		n = diag_efs_detect(sess);
+		if (n)
+			return n;
+	}
+
+	return efs_readlink(sess, path, buf, buf_size);
 }

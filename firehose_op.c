@@ -114,6 +114,100 @@ int firehose_op_execute(struct qdl_device *qdl,
 	return 0;
 }
 
+int firehose_op_execute_phased(struct qdl_device *qdl,
+			       int (*erase_all_fn)(struct qdl_device *),
+			       int (*apply_program)(struct qdl_device *, struct program *, int),
+			       int (*apply_read)(struct qdl_device *, struct read_op *, int),
+			       int (*apply_patch)(struct qdl_device *, struct patch *))
+{
+	unsigned int read_count = 0;
+	unsigned int prog_count = 0;
+	unsigned int patch_count = 0;
+	unsigned int idx;
+	struct firehose_op *op;
+	int ret;
+	int fd;
+
+	/* Pre-count for progress reporting */
+	list_for_each_entry(op, &firehose_ops, node) {
+		if (op->type == OP_READ)
+			read_count++;
+		else if (op->type == OP_PROGRAM)
+			prog_count++;
+		else if (op->type == OP_PATCH && op->patch->filename &&
+			 !strcmp(op->patch->filename, "DISK"))
+			patch_count++;
+	}
+
+	/* Phase 1: execute all reads (backups) */
+	if (read_count)
+		ux_info("phase 1: reading %u partition(s)...\n", read_count);
+	idx = 0;
+	list_for_each_entry(op, &firehose_ops, node) {
+		if (op->type != OP_READ)
+			continue;
+		mkpath(op->read_op->filename);
+		fd = open(op->read_op->filename,
+			  O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
+		if (fd < 0) {
+			ux_err("unable to open %s\n", op->read_op->filename);
+			return -1;
+		}
+		ret = apply_read(qdl, op->read_op, fd);
+		close(fd);
+		if (ret)
+			return ret;
+		idx++;
+	}
+
+	/* Phase 2: erase all partitions */
+	ux_info("phase 2: erasing all partitions...\n");
+	ret = erase_all_fn(qdl);
+	if (ret)
+		return ret;
+
+	/* Phase 3: execute all programs (flash) */
+	if (prog_count)
+		ux_info("phase 3: programming %u image(s)...\n", prog_count);
+	list_for_each_entry(op, &firehose_ops, node) {
+		if (op->type != OP_PROGRAM)
+			continue;
+		if (!op->program->filename)
+			continue;
+		fd = open(op->program->filename, O_RDONLY | O_BINARY);
+		if (fd < 0) {
+			ux_err("unable to open %s\n", op->program->filename);
+			return -1;
+		}
+		ret = apply_program(qdl, op->program, fd);
+		close(fd);
+		if (ret)
+			return ret;
+	}
+
+	/* Phase 4: execute all patches */
+	if (patch_count)
+		ux_info("phase 4: applying %u patch(es)...\n", patch_count);
+	idx = 0;
+	list_for_each_entry(op, &firehose_ops, node) {
+		if (op->type != OP_PATCH)
+			continue;
+		if (!op->patch->filename)
+			continue;
+		if (strcmp(op->patch->filename, "DISK"))
+			continue;
+		ret = apply_patch(qdl, op->patch);
+		if (ret)
+			return ret;
+		ux_progress("Applying patches", idx++, patch_count);
+	}
+
+	if (patch_count)
+		ux_info("%d patches applied\n", idx);
+
+	return 0;
+}
+
 void free_firehose_ops(void)
 {
 	struct firehose_op *op;
