@@ -40,7 +40,7 @@ static int poll_wait_diag(int fd, short events, int timeout_ms)
 		return -errno;
 	if (ret == 0)
 		return -ETIMEDOUT;
-	if (pfd.revents & POLLERR)
+	if (pfd.revents & (POLLERR | POLLHUP))
 		return -EIO;
 	return 0;
 }
@@ -579,6 +579,7 @@ struct diag_session *diag_open(const char *serial)
 	if (!sess)
 		return NULL;
 
+	snprintf(sess->port, sizeof(sess->port), "%s", port);
 	sess->fd = diag_port_open(port);
 	if (sess->fd < 0) {
 		free(sess);
@@ -660,11 +661,79 @@ int diag_online(struct diag_session *sess)
 	return diag_set_mode(sess, DIAG_MODE_ONLINE);
 }
 
+/*
+ * Reboot modem and reconnect DIAG session.
+ * Used for scenarios that require a full modem restart (e.g.,
+ * applying configuration changes that only take effect on boot).
+ */
+int diag_reboot_reconnect(struct diag_session *sess)
+{
+	int attempt;
+
+	ux_info("resetting modem for EFS reinitialization...\n");
+
+	/* Send reset command — modem will reboot */
+	diag_set_mode(sess, DIAG_MODE_RESET);
+
+	/* Close the port — it will disappear during reboot */
+#ifdef _WIN32
+	if (sess->fd > 0)
+		CloseHandle((HANDLE)sess->fd);
+	sess->fd = 0;
+#else
+	if (sess->fd >= 0)
+		close(sess->fd);
+	sess->fd = -1;
+#endif
+	sess->efs_detected = false;
+
+	/* Wait for modem to reboot — typically 20-40 seconds */
+	ux_info("waiting for modem to reboot...\n");
+	sleep(10);
+
+	/* Try to reopen the port with retries */
+	for (attempt = 0; attempt < 30; attempt++) {
+		sess->fd = diag_port_open(sess->port);
+		if (sess->fd >= 0)
+			break;
+		sleep(1);
+	}
+
+	if (sess->fd < 0) {
+		ux_err("failed to reconnect to %s after reboot\n",
+		       sess->port);
+		return -1;
+	}
+
+	ux_info("reconnected to %s after reboot\n", sess->port);
+
+	/* Re-drain, re-authenticate, re-detect EFS */
+#ifndef _WIN32
+	{
+		uint8_t drain[512];
+		int count = 0;
+
+		while (count < 100) {
+			if (poll_wait_diag(sess->fd, POLLIN, 100) != 0)
+				break;
+			if (read(sess->fd, drain, sizeof(drain)) <= 0)
+				break;
+			count++;
+		}
+	}
+#endif
+
+	diag_send_spc(sess);
+	diag_send_password(sess);
+
+	return diag_efs_detect(sess);
+}
+
 int diag_send(struct diag_session *sess, const uint8_t *cmd, size_t cmd_len,
 	      uint8_t *resp, size_t resp_size)
 {
-	uint8_t frame[8192];
-	uint8_t raw[8192];
+	uint8_t frame[16384];
+	uint8_t raw[16384];
 	int frame_len;
 	int retries;
 	int n, decoded;
@@ -942,6 +1011,126 @@ static int efs_query(struct diag_session *sess)
 	return 0;
 }
 
+/*
+ * EFS SYNC — flush the EFS2 journal to reclaim space.
+ *
+ * EFS2 is log-structured: every write creates a journal entry.  When
+ * many files are written in rapid succession (e.g., 244 NV items via
+ * opcode 0x27), the journal fills up and subsequent creates fail with
+ * ENOSPC even though logical space remains.  QPST avoids this because
+ * it has a ~37 second delay between NV writes and EFS PutItemFile calls
+ * (the modem's GC runs during that gap).
+ *
+ * SyncNoWait (opcode 48) starts an async sync.  SyncGetStatus (opcode
+ * 49) polls until complete (status == 0).  If the modem doesn't support
+ * sync, we fall back to a sleep.
+ *
+ * Packet formats (from libopenpst dm_efs.h):
+ *   SyncNoWait request:  header(4) + sequence(2) + path\0
+ *   SyncNoWait response: header(4) + sequence(2) + token(4) + error(4)
+ *   SyncGetStatus request:  header(4) + sequence(2) + token(4) + path\0
+ *   SyncGetStatus response: header(4) + sequence(2) + status(1) + error(4)
+ */
+static int efs_sync(struct diag_session *sess)
+{
+	uint8_t cmd[16];
+	uint8_t resp[64];
+	uint32_t token;
+	int32_t error;
+	uint16_t seq = 1;
+	int n, i;
+
+	/* SyncNoWait — start async sync for "/" */
+	memset(cmd, 0, sizeof(cmd));
+	efs_cmd_header(cmd, sess->efs_method, EFS2_DIAG_SYNC_NO_WAIT);
+	memcpy(&cmd[4], &seq, 2);		/* sequence */
+	cmd[6] = '/';				/* path */
+	cmd[7] = '\0';
+
+	n = diag_send(sess, cmd, 8, resp, sizeof(resp));
+	if (n < 14) {
+		/* Sync not supported — fall back to sleep */
+		ux_debug("EFS sync not supported, sleeping 5s\n");
+		sleep(5);
+		return 0;
+	}
+
+	memcpy(&token, &resp[6], 4);
+	memcpy(&error, &resp[10], 4);
+
+	if (error != 0) {
+		ux_debug("EFS sync error=%d, sleeping 5s\n", error);
+		sleep(5);
+		return 0;
+	}
+
+	ux_debug("EFS sync started (token=0x%08x)\n", token);
+
+	/* Poll SyncGetStatus until complete or timeout (30s) */
+	for (i = 0; i < 300; i++) {
+		usleep(100000);		/* 100ms */
+
+		memset(cmd, 0, sizeof(cmd));
+		efs_cmd_header(cmd, sess->efs_method,
+			       EFS2_DIAG_SYNC_GET_STATUS);
+		memcpy(&cmd[4], &seq, 2);	/* sequence */
+		memcpy(&cmd[6], &token, 4);	/* token */
+		cmd[10] = '/';			/* path */
+		cmd[11] = '\0';
+
+		n = diag_send(sess, cmd, 12, resp, sizeof(resp));
+		if (n < 11)
+			continue;
+
+		if (resp[6] == 0) {
+			ux_debug("EFS sync complete (%dms)\n",
+				 (i + 1) * 100);
+			return 0;
+		}
+	}
+
+	ux_debug("EFS sync timed out after 30s\n");
+	return 0;	/* non-fatal — continue anyway */
+}
+
+/*
+ * Build EFS2 HELLO request with proper parameters.
+ * QPST/EfsTools sends window sizes = 0x100000, version = 1,
+ * featureBits = 0xFFFFFFFF.  Sending zeroed fields may cause
+ * the modem to limit functionality.
+ *
+ * Packet layout (after 4-byte header):
+ *   [4-7]   targetPacketWindowSize     0x100000
+ *   [8-11]  targetPacketWindowByteSize 0x100000
+ *   [12-15] hostPacketWindowSize       0x100000
+ *   [16-19] hostPacketWindowByteSize   0x100000
+ *   [20-23] dirIteratorWindowSize      0x100000
+ *   [24-27] dirIteratorWindowByteSize  0x100000
+ *   [28-31] version                    1
+ *   [32-35] minVersion                 1
+ *   [36-39] maxVersion                 1
+ *   [40-43] featureBits                0xFFFFFFFF
+ */
+static void efs_hello_init(uint8_t *cmd, uint8_t method)
+{
+	uint32_t window = 0x100000;
+	uint32_t ver = 1;
+	uint32_t features = 0xFFFFFFFF;
+
+	memset(cmd, 0, 4 + 0x28);
+	efs_cmd_header(cmd, method, EFS2_DIAG_HELLO);
+	memcpy(&cmd[4], &window, 4);	/* targetPacketWindowSize */
+	memcpy(&cmd[8], &window, 4);	/* targetPacketWindowByteSize */
+	memcpy(&cmd[12], &window, 4);	/* hostPacketWindowSize */
+	memcpy(&cmd[16], &window, 4);	/* hostPacketWindowByteSize */
+	memcpy(&cmd[20], &window, 4);	/* dirIteratorWindowSize */
+	memcpy(&cmd[24], &window, 4);	/* dirIteratorWindowByteSize */
+	memcpy(&cmd[28], &ver, 4);	/* version */
+	memcpy(&cmd[32], &ver, 4);	/* minVersion */
+	memcpy(&cmd[36], &ver, 4);	/* maxVersion */
+	memcpy(&cmd[40], &features, 4);	/* featureBits */
+}
+
 int diag_efs_detect(struct diag_session *sess)
 {
 	uint8_t cmd[4 + 0x28];
@@ -949,8 +1138,7 @@ int diag_efs_detect(struct diag_session *sess)
 	int n;
 
 	/* Try alternate method first */
-	memset(cmd, 0, sizeof(cmd));
-	efs_cmd_header(cmd, DIAG_SUBSYS_EFS_ALT, EFS2_DIAG_HELLO);
+	efs_hello_init(cmd, DIAG_SUBSYS_EFS_ALT);
 
 	n = diag_send(sess, cmd, sizeof(cmd), resp, sizeof(resp));
 	if (n > 0 && resp[0] == DIAG_SUBSYS_CMD_F) {
@@ -962,8 +1150,7 @@ int diag_efs_detect(struct diag_session *sess)
 	}
 
 	/* Try standard method */
-	memset(cmd, 0, sizeof(cmd));
-	efs_cmd_header(cmd, DIAG_SUBSYS_EFS_STD, EFS2_DIAG_HELLO);
+	efs_hello_init(cmd, DIAG_SUBSYS_EFS_STD);
 
 	n = diag_send(sess, cmd, sizeof(cmd), resp, sizeof(resp));
 	if (n > 0 && resp[0] == DIAG_SUBSYS_CMD_F) {
@@ -1135,8 +1322,8 @@ static int efs_open(struct diag_session *sess, const char *path,
 	memcpy(&diag_errno, &resp[8], 4);
 
 	if (fdata < 0 || diag_errno != 0) {
-		ux_err("EFS open '%s' failed (fd=%d, errno=%d)\n",
-		       path, fdata, diag_errno);
+		ux_debug("EFS open '%s' failed (fd=%d, errno=%d, "
+			 "oflag=0x%x)\n", path, fdata, diag_errno, oflag);
 		return -1;
 	}
 
@@ -1411,7 +1598,7 @@ out:
 static int efs_write(struct diag_session *sess, int32_t fdata,
 		     uint32_t offset, const uint8_t *data, uint32_t len)
 {
-	uint8_t cmd[4 + 4 + 4 + 4 + EFS_MAX_WRITE_REQ];
+	uint8_t cmd[4 + 4 + 4 + EFS_MAX_WRITE_REQ];
 	uint8_t resp[64];
 	int32_t bytes_written;
 	int32_t diag_errno;
@@ -1420,14 +1607,19 @@ static int efs_write(struct diag_session *sess, int32_t fdata,
 	if (len > EFS_MAX_WRITE_REQ)
 		len = EFS_MAX_WRITE_REQ;
 
-	memset(cmd, 0, 16);
+	/*
+	 * EFS2_DIAG_WRITE request format (no length field):
+	 *   [header(4)] [fd(4)] [offset(4)] [data(len)]
+	 * Length is implicit from packet size.
+	 * Reference: libopenpst QcdmEfsWriteFileRequest
+	 */
+	memset(cmd, 0, 12);
 	efs_cmd_header(cmd, sess->efs_method, EFS2_DIAG_WRITE);
 	memcpy(&cmd[4], &fdata, 4);
 	memcpy(&cmd[8], &offset, 4);
-	memcpy(&cmd[12], &len, 4);
-	memcpy(&cmd[16], data, len);
+	memcpy(&cmd[12], data, len);
 
-	n = diag_send(sess, cmd, 16 + len, resp, sizeof(resp));
+	n = diag_send(sess, cmd, 12 + len, resp, sizeof(resp));
 	if (n < 20)
 		return -1;
 
@@ -1436,6 +1628,14 @@ static int efs_write(struct diag_session *sess, int32_t fdata,
 
 	if (diag_errno != 0 || bytes_written < 0)
 		return -1;
+
+	/* Cap at requested length — modem may report more than sent */
+	if ((uint32_t)bytes_written > len) {
+		ux_debug("efs_write: modem reported %d bytes written, "
+			 "requested %u (offset=%u) — capping\n",
+			 bytes_written, len, offset);
+		bytes_written = (int32_t)len;
+	}
 
 	return bytes_written;
 }
@@ -1464,9 +1664,11 @@ static int efs_mkdir_op(struct diag_session *sess, const char *path,
 
 	memcpy(&diag_errno, &resp[4], 4);
 
-	/* EEXIST is OK for directories */
-	if (diag_errno != 0 && diag_errno != 17)
+	/* EEXIST (17) and ENXIO (6) are OK — ENXIO means virtual mount point */
+	if (diag_errno != 0 && diag_errno != 17 && diag_errno != 6) {
+		ux_debug("EFS mkdir '%s': errno=%d\n", path, diag_errno);
 		return -1;
+	}
 
 	return 0;
 }
@@ -1491,7 +1693,9 @@ static int efs_mkdirp(struct diag_session *sess, const char *filepath)
 	for (p = buf + 1; *p; p++) {
 		if (*p == '/') {
 			*p = '\0';
-			efs_mkdir_op(sess, buf, 0x1FF);
+			if (efs_mkdir_op(sess, buf, 0x1FF) < 0)
+				ux_debug("efs_mkdirp: mkdir '%s' failed\n",
+					 buf);
 			*p = '/';
 		}
 	}
@@ -1662,109 +1866,128 @@ static int efs_get_item(struct diag_session *sess, const char *path,
 }
 
 /*
- * PUT v2 (opcode 38) — atomic item file write.
- * Format: [header 4][data_len uint16][pad 2][flags int32][mode int32][data][path\0]
- * This is the current version; opcode 26 is deprecated.
+ * PUT — atomic item file write (opcode 38).
+ *
+ * Request format (int16 mode, verified against QPST):
+ *   [header 4][data_len uint16][pad 2][flags int32][mode int16][data][path\0]
+ *   Data starts at offset 14, NOT 16.
+ *
+ * Response format (all int16 fields):
+ *   [header 4][perm int16][errno int16][bytes_written int16]
+ *   errno is at offset 6, NOT 4.
+ *
+ * PUT v1 (opcode 26) is NOT supported on RM551E-GL (returns EINVAL and
+ * causes timeout/hang). Do not attempt fallback.
+ *
+ * QPST uses PutItemFile for ALL EFS files during XQCN restore.
  */
 static int efs_put_item(struct diag_session *sess, const char *path,
 			const uint8_t *data, int32_t data_len,
 			int32_t flags, int32_t mode)
 {
-	uint8_t cmd[4096];
+	uint8_t cmd[8192];
 	uint8_t resp[64];
 	size_t path_len;
-	uint16_t dlen;
-	int32_t diag_errno;
+	int16_t diag_errno;
+	uint16_t dl16 = (uint16_t)data_len;
+	int16_t mode16 = (int16_t)mode;
 	int n;
 
 	path_len = strlen(path) + 1;
-	if ((size_t)data_len + path_len > sizeof(cmd) - 16)
+	if ((size_t)data_len + path_len > sizeof(cmd) - 14)
 		return -1;
 
-	dlen = (uint16_t)data_len;
-
-	memset(cmd, 0, 16);
+	memset(cmd, 0, 14);
 	efs_cmd_header(cmd, sess->efs_method, EFS2_DIAG_PUT);
-	memcpy(&cmd[4], &dlen, 2);
-	/* cmd[6-7] = 0 padding */
-	memcpy(&cmd[8], &flags, 4);
-	memcpy(&cmd[12], &mode, 4);
-	memcpy(&cmd[16], data, data_len);
-	memcpy(&cmd[16 + data_len], path, path_len);
+	memcpy(&cmd[4], &dl16, 2);		/* data_len: uint16 */
+	/* cmd[6..7] = 0 (padding) */
+	memcpy(&cmd[8], &flags, 4);		/* flags: int32 */
+	memcpy(&cmd[12], &mode16, 2);		/* mode: int16 */
+	memcpy(&cmd[14], data, data_len);	/* data */
+	memcpy(&cmd[14 + data_len], path, path_len);	/* path\0 */
 
-	n = diag_send(sess, cmd, 16 + data_len + path_len, resp, sizeof(resp));
-	if (n >= 8) {
-		memcpy(&diag_errno, &resp[4], 4);
+	n = diag_send(sess, cmd, 14 + data_len + path_len, resp, sizeof(resp));
+	if (n >= 10) {
+		memcpy(&diag_errno, &resp[6], 2);	/* errno: int16 at offset 6 */
 		if (diag_errno == 0)
 			return 0;
-		ux_debug("PUT v2 '%s' errno=%d\n", path, diag_errno);
+		ux_debug("PUT '%s' errno=%d\n", path, (int)diag_errno);
 	}
 
-	/* Fall back to deprecated opcode 26 (32-bit data_len) */
-	memset(cmd, 0, 16);
-	efs_cmd_header(cmd, sess->efs_method, EFS2_DIAG_PUT_V1);
-	memcpy(&cmd[4], &data_len, 4);
-	memcpy(&cmd[8], &flags, 4);
-	memcpy(&cmd[12], &mode, 4);
-	memcpy(&cmd[16], data, data_len);
-	memcpy(&cmd[16 + data_len], path, path_len);
-
-	n = diag_send(sess, cmd, 16 + data_len + path_len, resp, sizeof(resp));
-	if (n < 8)
-		return -1;
-
-	memcpy(&diag_errno, &resp[4], 4);
-	if (diag_errno != 0)
-		return -1;
-
-	return 0;
+	return -1;
 }
 
 /* Check if an EFS path is an item file (not a regular file) */
 static bool is_item_path(const char *path)
 {
 	return (strncmp(path, "/nv/item_files/", 15) == 0 ||
-		strncmp(path, "/nv/reg_files/", 14) == 0);
+		strncmp(path, "/nv/reg_files/", 14) == 0 ||
+		strncmp(path, "/cgps/nv/item_files/", 20) == 0 ||
+		strncmp(path, "/sd/", 4) == 0);
 }
 
 /*
- * Write an item file to EFS using PUT (atomic), with fallback
- * to open/write/close with O_ITEMFILE.
+ * Try to write a file to EFS (single attempt, no retry).
+ * Returns 0 on success, -1 on failure.
  */
-static int efs_write_item(struct diag_session *sess, const char *path,
-			  const uint8_t *data, size_t data_len, int32_t mode)
+static int efs_write_file_once(struct diag_session *sess, const char *path,
+			       const uint8_t *data, size_t data_len,
+			       int32_t mode, bool item_file)
 {
 	int32_t flags;
 	int32_t fdata;
+	uint32_t offset = 0;
+	size_t remaining;
 
-	/* Try PUT with O_ITEMFILE|O_AUTODIR first (atomic, preferred) */
-	flags = EFS_O_CREAT | EFS_O_WRONLY | EFS_O_TRUNC |
-		EFS_O_ITEMFILE | EFS_O_AUTODIR;
-	if (efs_put_item(sess, path, data, (int32_t)data_len,
-			 flags, mode) == 0)
-		return 0;
-
-	/* Fallback: open with O_ITEMFILE + O_AUTODIR, write, close */
-	efs_mkdirp(sess, path);
-	flags = 0x301 | EFS_O_ITEMFILE | EFS_O_AUTODIR;
-	fdata = efs_open(sess, path, flags, mode);
-	if (fdata < 0) {
-		/* Last try: open without O_ITEMFILE */
-		flags = 0x301 | EFS_O_AUTODIR;
-		fdata = efs_open(sess, path, flags, mode);
-		if (fdata < 0)
-			return -1;
+	/*
+	 * Try PUT first — atomic item file write.
+	 * Include O_AUTODIR so the modem auto-creates parent directories.
+	 * On a freshly-erased filesystem, PUT without O_AUTODIR fails
+	 * with ENOENT and the fallback path can crash the modem.
+	 *
+	 * Skip PUT for files > 6KB — they won't fit in the HDLC frame
+	 * and must use the chunked open/write/close path.
+	 */
+	if (data_len <= 6144) {
+		flags = EFS_O_CREAT | EFS_O_WRONLY | EFS_O_TRUNC |
+			EFS_O_ITEMFILE | EFS_O_AUTODIR;
+		if (efs_put_item(sess, path, data, (int32_t)data_len,
+				 flags, mode) == 0)
+			return 0;
 	}
 
-	uint32_t offset = 0;
-	size_t remaining = data_len;
+	/* PUT failed or too large — fall back to open/write/close */
+	efs_mkdirp(sess, path);
 
+	/*
+	 * Try O_ITEMFILE first for item paths — the modem needs these
+	 * as item files (mode 0160xxx), not regular files (0100xxx).
+	 * Do NOT combine O_ITEMFILE with O_AUTODIR here — that combo
+	 * crashes some modems.  efs_mkdirp() already created the dirs.
+	 */
+	if (item_file) {
+		fdata = efs_open(sess, path,
+				 EFS_O_WRONLY | EFS_O_CREAT | EFS_O_TRUNC |
+				 EFS_O_ITEMFILE, mode);
+		if (fdata >= 0)
+			goto do_write;
+	}
+
+	fdata = efs_open(sess, path,
+			 EFS_O_WRONLY | EFS_O_CREAT | EFS_O_TRUNC |
+			 EFS_O_AUTODIR, mode);
+	if (fdata < 0)
+		return -1;
+
+do_write:
+
+	remaining = data_len;
 	while (remaining > 0) {
 		uint32_t chunk = remaining > EFS_MAX_WRITE_REQ ?
 				 EFS_MAX_WRITE_REQ : remaining;
 		int w = efs_write(sess, fdata, offset, data + offset, chunk);
 
-		if (w < 0) {
+		if (w <= 0 || (size_t)w > remaining) {
 			efs_close(sess, fdata);
 			return -1;
 		}
@@ -1773,6 +1996,29 @@ static int efs_write_item(struct diag_session *sess, const char *path,
 	}
 	efs_close(sess, fdata);
 	return 0;
+}
+
+/*
+ * Write a file to EFS with ENOSPC retry.
+ *
+ * EFS2 is log-structured — rapid writes fill the journal, causing
+ * ENOSPC even when logical space remains.  If the first attempt fails,
+ * flush the journal via EFS SYNC and retry once.
+ */
+static int efs_write_file(struct diag_session *sess, const char *path,
+			  const uint8_t *data, size_t data_len,
+			  int32_t mode, bool item_file)
+{
+	if (efs_write_file_once(sess, path, data, data_len,
+				mode, item_file) == 0)
+		return 0;
+
+	/* First attempt failed — sync journal and retry */
+	ux_debug("retrying '%s' after EFS sync\n", path);
+	efs_sync(sess);
+
+	return efs_write_file_once(sess, path, data, data_len,
+				   mode, item_file);
 }
 
 /*
@@ -2339,8 +2585,8 @@ int diag_efs_restore(struct diag_session *sess, const char *tar_file)
 			int16_t perm = (int16_t)(mode & 0x1FF);
 			unsigned long tar_blocks = (size + 511) / 512;
 
-			/* Item files: buffer and use PUT */
-			if (item && size <= 2048) {
+			/* Small files: buffer and use efs_write_file */
+			if (size <= 2048) {
 				uint8_t ibuf[2048];
 				ssize_t r = read(fd, ibuf, size);
 
@@ -2350,8 +2596,9 @@ int diag_efs_restore(struct diag_session *sess, const char *tar_file)
 					break;
 				}
 
-				if (efs_write_item(sess, efs_path,
-						   ibuf, size, perm) == 0) {
+				if (efs_write_file(sess, efs_path,
+						   ibuf, size, perm,
+						   item) == 0) {
 					files_restored++;
 					ux_debug("restored %s (%lu bytes)\n",
 						 efs_path, size);
@@ -2368,11 +2615,12 @@ int diag_efs_restore(struct diag_session *sess, const char *tar_file)
 				break;
 			}
 
-			/* Regular files: open/write/close */
+			/* Large files: open/write/close */
 			efs_mkdirp(sess, efs_path);
 
 			int32_t fdata = efs_open(sess, efs_path,
-						 0x301 | EFS_O_AUTODIR,
+						 EFS_O_WRONLY | EFS_O_CREAT |
+						 EFS_O_TRUNC | EFS_O_AUTODIR,
 						 (int32_t)perm);
 			if (fdata < 0) {
 				ux_warn("failed to create file '%s'\n",
@@ -2619,11 +2867,12 @@ int diag_efs_put(struct diag_session *sess, const char *local_path,
 	}
 
 	/*
-	 * For item files, use PUT with O_ITEMFILE.
-	 * For regular files, use open/write/close with O_AUTODIR.
+	 * Small files: buffer and use efs_write_file (handles PUT
+	 * fallback for item files + plain open for regular files).
 	 */
-	if (is_item_path(efs_path) && sb.st_size <= 2048) {
+	if (sb.st_size <= 2048) {
 		uint8_t ibuf[2048];
+		bool item = is_item_path(efs_path);
 		ssize_t r = read(local_fd, ibuf, sb.st_size);
 
 		close(local_fd);
@@ -2631,14 +2880,17 @@ int diag_efs_put(struct diag_session *sess, const char *local_path,
 			ux_err("read from '%s' failed\n", local_path);
 			return -1;
 		}
-		ux_info("writing '%s' to EFS '%s' (%ld bytes, item file)\n",
-			local_path, efs_path, (long)sb.st_size);
-		return efs_write_item(sess, efs_path, ibuf,
-				      (size_t)sb.st_size, 0644);
+		ux_info("writing '%s' to EFS '%s' (%ld bytes%s)\n",
+			local_path, efs_path, (long)sb.st_size,
+			item ? ", item file" : "");
+		return efs_write_file(sess, efs_path, ibuf,
+				      (size_t)sb.st_size, 0644, item);
 	}
 
 	efs_mkdirp(sess, efs_path);
-	fdata = efs_open(sess, efs_path, 0x301 | EFS_O_AUTODIR, 0644);
+	fdata = efs_open(sess, efs_path,
+			EFS_O_WRONLY | EFS_O_CREAT | EFS_O_TRUNC |
+			EFS_O_AUTODIR, 0644);
 	if (fdata < 0) {
 		ux_err("cannot create EFS file '%s'\n", efs_path);
 		close(local_fd);
@@ -3908,7 +4160,7 @@ static uint8_t *xqcn_parse_hex(const char *hex_str, size_t *out_len)
 	}
 
 	slen = strlen(hex_str);
-	blen = (slen + 1) / 3 + 1; /* rough upper bound */
+	blen = slen / 2 + 1; /* safe upper bound: 2 hex chars per byte min */
 	buf = malloc(blen);
 	if (!buf) {
 		*out_len = 0;
@@ -3940,10 +4192,181 @@ static uint8_t *xqcn_parse_hex(const char *hex_str, size_t *out_len)
 /*
  * XQCN restore — parse XQCN XML and restore NV items + EFS files.
  */
+/*
+ * Find a named section under def_node.
+ * Returns the xmlNodePtr for the <Storage Name="section_name"> element.
+ */
+static xmlNodePtr xqcn_find_section(xmlNodePtr def_node, const char *section_name)
+{
+	xmlNodePtr section;
+
+	for (section = def_node->children; section; section = section->next) {
+		xmlChar *name;
+
+		if (section->type != XML_ELEMENT_NODE)
+			continue;
+		if (strcmp((char *)section->name, "Storage") != 0)
+			continue;
+		name = xmlGetProp(section, (const xmlChar *)"Name");
+		if (!name)
+			continue;
+		if (strcmp((char *)name, section_name) == 0) {
+			xmlFree(name);
+			return section;
+		}
+		xmlFree(name);
+	}
+	return NULL;
+}
+
+/*
+ * Restore one EFS section from an XQCN file.
+ * Parses EFS_Dir + EFS_Data, writes files to the modem.
+ */
+static void xqcn_restore_efs_section(struct diag_session *sess,
+				      xmlNodePtr section,
+				      const char *section_name,
+				      bool is_backup,
+				      int *written, int *skipped)
+{
+	xmlNodePtr child, stream;
+	xmlNodePtr dir_node = NULL, data_node = NULL;
+	int entry_count = 0;
+	char **paths = NULL;
+	uint8_t **datas = NULL;
+	size_t *sizes = NULL;
+	int n;
+
+	for (child = section->children; child; child = child->next) {
+		xmlChar *cname;
+
+		if (child->type != XML_ELEMENT_NODE)
+			continue;
+		cname = xmlGetProp(child, (const xmlChar *)"Name");
+		if (!cname)
+			continue;
+		if (!strcmp((char *)cname, "EFS_Dir"))
+			dir_node = child;
+		else if (!strcmp((char *)cname, "EFS_Data"))
+			data_node = child;
+		xmlFree(cname);
+	}
+
+	if (!dir_node || !data_node)
+		return;
+
+	/* Count entries */
+	for (stream = dir_node->children; stream; stream = stream->next) {
+		if (stream->type == XML_ELEMENT_NODE)
+			entry_count++;
+	}
+	if (entry_count == 0)
+		return;
+
+	paths = calloc(entry_count, sizeof(char *));
+	datas = calloc(entry_count, sizeof(uint8_t *));
+	sizes = calloc(entry_count, sizeof(size_t));
+	if (!paths || !datas || !sizes) {
+		free(paths);
+		free(datas);
+		free(sizes);
+		return;
+	}
+
+	/* Parse dir entries */
+	n = 0;
+	for (stream = dir_node->children; stream; stream = stream->next) {
+		xmlChar *val;
+		uint8_t *raw;
+		size_t raw_len;
+		const char *pstart;
+		size_t plen;
+
+		if (stream->type != XML_ELEMENT_NODE || n >= entry_count)
+			continue;
+
+		val = xmlGetProp(stream, (const xmlChar *)"Value");
+		if (!val)
+			continue;
+
+		raw = xqcn_parse_hex((char *)val, &raw_len);
+		xmlFree(val);
+		if (!raw)
+			continue;
+
+		if (is_backup && raw_len > 8) {
+			pstart = (char *)raw + 8;
+			plen = strnlen(pstart, raw_len - 8);
+		} else {
+			pstart = (char *)raw;
+			plen = strnlen(pstart, raw_len);
+		}
+
+		paths[n] = malloc(plen + 1);
+		if (paths[n]) {
+			memcpy(paths[n], pstart, plen);
+			paths[n][plen] = '\0';
+		}
+		free(raw);
+		n++;
+	}
+
+	/* Parse data entries */
+	n = 0;
+	for (stream = data_node->children; stream; stream = stream->next) {
+		xmlChar *val;
+
+		if (stream->type != XML_ELEMENT_NODE || n >= entry_count)
+			continue;
+
+		val = xmlGetProp(stream, (const xmlChar *)"Value");
+		if (!val)
+			continue;
+
+		datas[n] = xqcn_parse_hex((char *)val, &sizes[n]);
+		xmlFree(val);
+		n++;
+	}
+
+	/* Write files to EFS */
+	ux_info("  %s: %d entries\n", section_name, entry_count);
+
+	for (n = 0; n < entry_count; n++) {
+		bool item;
+
+		if (!paths[n] || !datas[n])
+			continue;
+
+		item = is_item_path(paths[n]);
+
+		ux_debug("%s file: %s, size %zu%s\n",
+			 section_name, paths[n], sizes[n],
+			 item ? " (item)" : "");
+
+		if (efs_write_file(sess, paths[n], datas[n], sizes[n],
+				   0x1FF, item) < 0) {
+			(*skipped)++;
+			ux_debug("  FAILED\n");
+			continue;
+		}
+		(*written)++;
+		ux_debug("  OK\n");
+	}
+
+	for (n = 0; n < entry_count; n++) {
+		free(paths[n]);
+		free(datas[n]);
+	}
+	free(paths);
+	free(datas);
+	free(sizes);
+}
+
 int diag_efs_restore_xqcn(struct diag_session *sess, const char *xqcn_file)
 {
 	xmlDocPtr doc;
-	xmlNodePtr root, sub0, def_node, section, child, stream;
+	xmlNodePtr root, sub0, def_node, section;
+	xmlNodePtr stream;
 	int nv_written = 0, nv_skipped = 0;
 	int efs_written = 0, efs_skipped = 0;
 	int n;
@@ -3998,282 +4421,124 @@ int diag_efs_restore_xqcn(struct diag_session *sess, const char *xqcn_file)
 
 	ux_info("restoring from XQCN: %s\n", xqcn_file);
 
-	/* Process each section */
-	for (section = def_node->children; section; section = section->next) {
-		xmlChar *name;
+	/* Switch to offline mode for EFS operations */
+	diag_offline(sess);
 
-		if (section->type != XML_ELEMENT_NODE)
-			continue;
+	/*
+	 * Phase 1: NV numbered items.
+	 * These go through the NV API (opcode 0x27), which internally
+	 * creates files under /nv/item_files/ in EFS2.
+	 */
+	section = xqcn_find_section(def_node, "NV_NUMBERED_ITEMS");
+	if (section) {
+		for (stream = section->children; stream;
+		     stream = stream->next) {
+			xmlChar *sname, *val;
+			uint8_t *data;
+			size_t data_len;
+			size_t off;
 
-		name = xmlGetProp(section, (const xmlChar *)"Name");
-		if (!name)
-			continue;
+			if (stream->type != XML_ELEMENT_NODE)
+				continue;
 
-		/* NV_NUMBERED_ITEMS */
-		if (!strcmp((char *)name, "NV_NUMBERED_ITEMS") &&
-		    !strcmp((char *)section->name, "Storage")) {
-			for (stream = section->children; stream;
-			     stream = stream->next) {
-				xmlChar *sname, *val;
-				uint8_t *data;
-				size_t data_len;
-				size_t off;
+			sname = xmlGetProp(stream, (const xmlChar *)"Name");
+			if (!sname)
+				continue;
 
-				if (stream->type != XML_ELEMENT_NODE)
-					continue;
-
-				sname = xmlGetProp(stream,
-						   (const xmlChar *)"Name");
-				if (!sname)
-					continue;
-
-				/* Only restore default NV_ITEM_ARRAY */
-				if (strcmp((char *)sname,
-					   "NV_ITEM_ARRAY") != 0) {
-					xmlFree(sname);
-					continue;
-				}
+			if (strcmp((char *)sname, "NV_ITEM_ARRAY") != 0) {
 				xmlFree(sname);
-
-				val = xmlGetProp(stream,
-						 (const xmlChar *)"Value");
-				if (!val)
-					continue;
-
-				data = xqcn_parse_hex((char *)val, &data_len);
-				xmlFree(val);
-				if (!data)
-					continue;
-
-				ux_info("restoring %zu NV items...\n",
-					data_len / XQCN_NV_RECORD_SIZE);
-
-				for (off = 0;
-				     off + XQCN_NV_RECORD_SIZE <= data_len;
-				     off += XQCN_NV_RECORD_SIZE) {
-					uint32_t nv_id;
-					uint16_t item_id;
-					int wr;
-
-					memcpy(&nv_id, &data[off + 4], 4);
-					item_id = (uint16_t)nv_id;
-					wr = diag_nv_write(sess, item_id,
-							   &data[off + 8],
-							   NV_ITEM_DATA_SIZE);
-					if (wr == 0) {
-						nv_written++;
-						ux_debug("NV %d: NV_DONE_S\n",
-							 item_id);
-					} else if (wr > 0) {
-						nv_skipped++;
-						ux_debug("NV %d: %s\n",
-							 item_id,
-							 diag_nv_status_str(
-							 (uint16_t)wr));
-					} else {
-						nv_skipped++;
-						ux_debug("NV %d: Bad Response\n",
-							 item_id);
-					}
-				}
-				free(data);
-			}
-		}
-
-		/* EFS sections: EFS_Backup, Provisioning, NV_Items */
-		if ((!strcmp((char *)name, "EFS_Backup") ||
-		     !strcmp((char *)name, "Provisioning_Item_Files") ||
-		     !strcmp((char *)name, "NV_Items")) &&
-		    !strcmp((char *)section->name, "Storage")) {
-			xmlNodePtr dir_node = NULL, data_node = NULL;
-			bool is_backup = !strcmp((char *)name, "EFS_Backup");
-			bool is_item_section =
-				!strcmp((char *)name,
-					"Provisioning_Item_Files") ||
-				!strcmp((char *)name, "NV_Items");
-
-			ux_debug("processing section: %s\n", (char *)name);
-			int entry_count = 0;
-			char **paths = NULL;
-			uint8_t **datas = NULL;
-			size_t *sizes = NULL;
-
-			for (child = section->children; child;
-			     child = child->next) {
-				xmlChar *cname;
-
-				if (child->type != XML_ELEMENT_NODE)
-					continue;
-				cname = xmlGetProp(child,
-						   (const xmlChar *)"Name");
-				if (!cname)
-					continue;
-				if (!strcmp((char *)cname, "EFS_Dir"))
-					dir_node = child;
-				else if (!strcmp((char *)cname, "EFS_Data"))
-					data_node = child;
-				xmlFree(cname);
-			}
-
-			if (!dir_node || !data_node) {
-				xmlFree(name);
 				continue;
 			}
+			xmlFree(sname);
 
-			/* Count entries in dir_node */
-			for (stream = dir_node->children; stream;
-			     stream = stream->next) {
-				if (stream->type == XML_ELEMENT_NODE)
-					entry_count++;
-			}
-
-			if (entry_count == 0) {
-				xmlFree(name);
+			val = xmlGetProp(stream, (const xmlChar *)"Value");
+			if (!val)
 				continue;
-			}
 
-			paths = calloc(entry_count, sizeof(char *));
-			datas = calloc(entry_count, sizeof(uint8_t *));
-			sizes = calloc(entry_count, sizeof(size_t));
+			data = xqcn_parse_hex((char *)val, &data_len);
+			xmlFree(val);
+			if (!data)
+				continue;
 
-			/* Parse dir entries */
-			n = 0;
-			for (stream = dir_node->children; stream;
-			     stream = stream->next) {
-				xmlChar *val;
-				uint8_t *raw;
-				size_t raw_len;
-				const char *pstart;
-				size_t plen;
+			ux_info("restoring %zu NV items...\n",
+				data_len / XQCN_NV_RECORD_SIZE);
 
-				if (stream->type != XML_ELEMENT_NODE ||
-				    n >= entry_count)
-					continue;
+			for (off = 0;
+			     off + XQCN_NV_RECORD_SIZE <= data_len;
+			     off += XQCN_NV_RECORD_SIZE) {
+				uint32_t nv_id;
+				uint16_t item_id;
+				int wr;
 
-				val = xmlGetProp(stream,
-						 (const xmlChar *)"Value");
-				if (!val)
-					continue;
-
-				raw = xqcn_parse_hex((char *)val, &raw_len);
-				xmlFree(val);
-				if (!raw)
-					continue;
-
-				if (is_backup && raw_len > 8) {
-					/* 8-byte header + path */
-					pstart = (char *)raw + 8;
-					plen = strnlen(pstart, raw_len - 8);
+				memcpy(&nv_id, &data[off + 4], 4);
+				item_id = (uint16_t)nv_id;
+				wr = diag_nv_write(sess, item_id,
+						   &data[off + 8],
+						   NV_ITEM_DATA_SIZE);
+				if (wr == 0) {
+					nv_written++;
+					ux_debug("NV %d: NV_DONE_S\n",
+						 item_id);
+				} else if (wr > 0) {
+					nv_skipped++;
+					ux_debug("NV %d: %s\n", item_id,
+						 diag_nv_status_str(
+						 (uint16_t)wr));
 				} else {
-					/* raw null-terminated path */
-					pstart = (char *)raw;
-					plen = strnlen(pstart, raw_len);
+					nv_skipped++;
+					ux_debug("NV %d: Bad Response\n",
+						 item_id);
 				}
-
-				paths[n] = malloc(plen + 1);
-				if (paths[n]) {
-					memcpy(paths[n], pstart, plen);
-					paths[n][plen] = '\0';
-				}
-				free(raw);
-				n++;
 			}
-
-			/* Parse data entries */
-			n = 0;
-			for (stream = data_node->children; stream;
-			     stream = stream->next) {
-				xmlChar *val;
-
-				if (stream->type != XML_ELEMENT_NODE ||
-				    n >= entry_count)
-					continue;
-
-				val = xmlGetProp(stream,
-						 (const xmlChar *)"Value");
-				if (!val)
-					continue;
-
-				datas[n] = xqcn_parse_hex((char *)val,
-							  &sizes[n]);
-				xmlFree(val);
-				n++;
-			}
-
-			/* Write files to EFS */
-			ux_debug("%s: %d entries to restore\n",
-				 (char *)name, entry_count);
-
-			for (n = 0; n < entry_count; n++) {
-				bool item;
-
-				if (!paths[n] || !datas[n])
-					continue;
-
-				item = is_item_section ||
-				       is_item_path(paths[n]);
-
-				ux_debug("%s file: %s, size %zu%s\n",
-					 (char *)name, paths[n], sizes[n],
-					 item ? " (item)" : "");
-
-				if (item) {
-					/* Item files: use PUT with O_ITEMFILE */
-					if (efs_write_item(sess, paths[n],
-							   datas[n], sizes[n],
-							   0x1FF) < 0) {
-						efs_skipped++;
-						ux_debug("  FAILED: write error\n");
-						continue;
-					}
-				} else {
-					/* Regular files: open/write/close */
-					int32_t fdata;
-					uint32_t off = 0;
-					size_t rem;
-
-					efs_mkdirp(sess, paths[n]);
-					fdata = efs_open(sess, paths[n],
-							 0x301 | EFS_O_AUTODIR,
-							 0x1FF);
-					if (fdata < 0) {
-						efs_skipped++;
-						ux_debug("  FAILED: cannot create\n");
-						continue;
-					}
-
-					rem = sizes[n];
-					while (rem > 0) {
-						uint32_t chunk = rem >
-							EFS_MAX_WRITE_REQ ?
-							EFS_MAX_WRITE_REQ :
-							rem;
-						int w = efs_write(sess,
-							fdata, off,
-							datas[n] + off,
-							chunk);
-
-						if (w < 0)
-							break;
-						off += w;
-						rem -= w;
-					}
-					efs_close(sess, fdata);
-				}
-				efs_written++;
-				ux_debug("  OK\n");
-			}
-
-			for (n = 0; n < entry_count; n++) {
-				free(paths[n]);
-				free(datas[n]);
-			}
-			free(paths);
-			free(datas);
-			free(sizes);
+			free(data);
 		}
+	}
 
-		xmlFree(name);
+	/*
+	 * Phase 2: Sync EFS journal after NV writes.
+	 *
+	 * NV writes (opcode 0x27) internally create files in EFS2,
+	 * filling the log-structured journal.  Without syncing, the
+	 * journal is full and subsequent EFS file creates fail with
+	 * ENOSPC.  QPST has a ~37 second gap here during which the
+	 * modem's GC runs.  We use an explicit sync instead.
+	 */
+	ux_info("syncing EFS after NV writes...\n");
+	efs_sync(sess);
+
+	/*
+	 * Phase 3: EFS file sections.
+	 *
+	 * Process in QPST order: Provisioning_Item_Files first, then
+	 * EFS_Backup (rfnv items), then NV_Items (rfc duplicates).
+	 * Each section is followed by a sync to keep the journal clear.
+	 *
+	 * Individual writes also retry with sync on ENOSPC via
+	 * efs_write_file().
+	 */
+	ux_info("restoring EFS files...\n");
+
+	section = xqcn_find_section(def_node, "Provisioning_Item_Files");
+	if (section) {
+		xqcn_restore_efs_section(sess, section,
+					 "Provisioning_Item_Files", false,
+					 &efs_written, &efs_skipped);
+		efs_sync(sess);
+	}
+
+	section = xqcn_find_section(def_node, "EFS_Backup");
+	if (section) {
+		xqcn_restore_efs_section(sess, section,
+					 "EFS_Backup", true,
+					 &efs_written, &efs_skipped);
+		efs_sync(sess);
+	}
+
+	section = xqcn_find_section(def_node, "NV_Items");
+	if (section) {
+		xqcn_restore_efs_section(sess, section,
+					 "NV_Items", false,
+					 &efs_written, &efs_skipped);
 	}
 
 	xmlFreeDoc(doc);
@@ -4286,6 +4551,13 @@ int diag_efs_restore_xqcn(struct diag_session *sess, const char *xqcn_file)
 	if (efs_skipped > 0)
 		ux_info("  (skipped files could not be created via "
 			"PUT or open — check debug log)\n");
+
+	/* Full device reset — QPST reboots after restore so the modem
+	 * reloads EFS configuration on boot.  diag_online() alone is
+	 * not sufficient; the modem stays in CFUN=7 without a reboot. */
+	ux_info("rebooting modem to apply changes...\n");
+	diag_set_mode(sess, DIAG_MODE_RESET);
+
 	return 0;
 }
 

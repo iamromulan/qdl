@@ -3382,14 +3382,15 @@ static int qdl_efsrestore(int argc, char **argv)
 	if (!sess)
 		return 1;
 
-	diag_offline(sess);
-
-	if (file_starts_with_xml(argv[optind]))
+	if (file_starts_with_xml(argv[optind])) {
+		/* XQCN restore manages offline mode internally */
 		ret = diag_efs_restore_xqcn(sess, argv[optind]);
-	else
+	} else {
+		diag_offline(sess);
 		ret = diag_efs_restore(sess, argv[optind]);
+		diag_online(sess);
+	}
 
-	diag_online(sess);
 	diag_close(sess);
 	return !!ret;
 }

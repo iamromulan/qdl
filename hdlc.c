@@ -53,7 +53,7 @@ int hdlc_encode(const uint8_t *cmd, size_t cmd_len,
 		uint8_t *out, size_t out_size)
 {
 	uint16_t crc;
-	uint8_t data[4096];
+	uint8_t data[16384];
 	size_t data_len;
 	size_t j = 0;
 	size_t i;

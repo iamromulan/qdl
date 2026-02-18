@@ -51,18 +51,28 @@
 #define EFS2_DIAG_READLINK	14
 #define EFS2_DIAG_CHMOD		18
 
+/* EFS space/info commands */
+#define EFS2_DIAG_STATFS	19
+#define EFS2_DIAG_DELTREE	37
+
 /* EFS item interface commands (bypass file-level ACLs) */
 #define EFS2_DIAG_PUT_V1	26	/* deprecated */
 #define EFS2_DIAG_GET_V1	27	/* deprecated */
 #define EFS2_DIAG_PUT		38	/* current version */
 #define EFS2_DIAG_GET		39	/* current version */
 
+/* EFS sync commands — flush journal to reclaim space */
+#define EFS2_DIAG_SYNC_NO_WAIT		48
+#define EFS2_DIAG_SYNC_GET_STATUS	49
+
 /*
- * Qualcomm EFS2 open flags (ARM ABI values, not standard POSIX).
- * Verified: efs_open(0x301) = O_WRONLY|O_CREAT|O_TRUNC works.
+ * Qualcomm EFS2 open flags.
+ * O_CREAT = 0x40 (POSIX), NOT 0x0100 (ARM ABI).
+ * 0x0100 was previously assumed but only worked for overwrites,
+ * not for creating new files.
  */
 #define EFS_O_WRONLY	0x0001
-#define EFS_O_CREAT	0x0100
+#define EFS_O_CREAT	0x0040
 #define EFS_O_TRUNC	0x0200
 #define EFS_O_ITEMFILE	0x40000		/* create as EFS item file */
 #define EFS_O_AUTODIR	0x80000		/* auto-create parent directories */
@@ -108,6 +118,7 @@ struct diag_session {
 #endif
 	uint8_t efs_method;
 	bool efs_detected;
+	char port[256];		/* port path for reconnection */
 };
 
 struct nv_item {
@@ -142,6 +153,7 @@ void diag_close(struct diag_session *sess);
 /* Mode control */
 int diag_offline(struct diag_session *sess);
 int diag_online(struct diag_session *sess);
+int diag_reboot_reconnect(struct diag_session *sess);
 
 /* Low-level send/receive */
 int diag_send(struct diag_session *sess, const uint8_t *cmd, size_t cmd_len,
