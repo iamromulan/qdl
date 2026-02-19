@@ -49,12 +49,14 @@ enum {
 };
 
 bool qdl_debug;
+FILE *qdl_log_file;
 
 static int sahara_run_with_retry(struct qdl_device *qdl,
 				 const struct sahara_image *images,
 				 const char *ramdump_path,
 				 const char *ramdump_filter,
 				 const char *serial);
+static void print_all_help(FILE *out);
 
 static int detect_type(const char *verb)
 {
@@ -577,7 +579,7 @@ static enum qdl_storage_type detect_storage_from_filename(const char *filename)
 	if (strcasestr(filename, "_ufs") || strcasestr(filename, "ufs_"))
 		return QDL_STORAGE_UFS;
 
-	return QDL_STORAGE_UFS; /* default */
+	return QDL_STORAGE_NAND; /* default */
 }
 
 /*
@@ -616,7 +618,7 @@ static char *find_programmer_recursive(const char *base_dir)
 
 /*
  * Detect storage type from rawprogram XMLs in a directory.
- * Returns detected type, or QDL_STORAGE_UFS as default.
+ * Returns detected type, or QDL_STORAGE_NAND as default.
  */
 static enum qdl_storage_type detect_storage_from_directory(const char *base_dir)
 {
@@ -635,7 +637,7 @@ static enum qdl_storage_type detect_storage_from_directory(const char *base_dir)
 	}
 
 	free(rawprogram);
-	return QDL_STORAGE_UFS;
+	return QDL_STORAGE_NAND;
 }
 
 static int firmware_detect(const char *base_dir, struct firmware_files *fw)
@@ -644,7 +646,7 @@ static int firmware_detect(const char *base_dir, struct firmware_files *fw)
 	int i;
 
 	memset(fw, 0, sizeof(*fw));
-	fw->storage_type = QDL_STORAGE_UFS;
+	fw->storage_type = QDL_STORAGE_NAND;
 
 	/* Find programmer file by searching recursively from base directory */
 	fw->programmer = find_programmer_recursive(base_dir);
@@ -734,20 +736,22 @@ static void print_usage(FILE *out)
 
 	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
 		       "qfenix");
-	fprintf(out, " - Qualcomm Firehose / DIAG multi-tool\n");
+	fprintf(out, " - A Qualcomm Firehose / DIAG multi-tool by iamromulan\n");
+	fprintf(out, "A Custom fork of https://github.com/linux-msm/qdl\n");
 #ifdef BUILD_STATIC
 	fprintf(out, "%s, %s %s, static binary\n", VERSION, __DATE__, __TIME__);
 #else
 	fprintf(out, "%s, %s %s, dynamically linked\n", VERSION, __DATE__, __TIME__);
 #endif
+	fprintf(out, "\nCheck for new updates here: https://github.com/iamromulan/qfenix/releases\n");
 
 	fprintf(out, "\nUsage: %s [options] -F <firmware-dir>\n", __progname);
 	fprintf(out, "       %s [options] <prog.mbn> <read-xml|patch-xml|program-xml>...\n", __progname);
 	fprintf(out, "       %s [options] <prog.mbn> (read|write) <address> <binary>...\n", __progname);
-	fprintf(out, "       %s [subcommand] [options] (--help to see options for each subcommand)\n", __progname);
+	fprintf(out, "       %s <subcommand> [options]\n", __progname);
 
 	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
-		       "\nEDL Subcommands");
+		       "\nEDL Commands");
 	fprintf(out, " (require a firehose programmer/loader):\n");
 	fprintf(out, "\n  The loader/programmer can be provided 3 ways:\n");
 	fprintf(out, "    1. Auto-detected from current directory (or subdirectory)\n");
@@ -755,25 +759,30 @@ static void print_usage(FILE *out)
 	fprintf(out, "    3. Exact programmer path as a positional argument\n");
 	fprintf(out, "\n  flash         Flash firmware (same as -F)\n");
 	fprintf(out, "  printgpt      Print GPT/NAND partition tables\n");
-	fprintf(out, "                  (use --make-xml=program and/or --make-xml=read to generate XML)\n");
 	fprintf(out, "  storageinfo   Query storage hardware information\n");
-	fprintf(out, "  reset         Reset, power-off, or EDL-reboot a device (default: reset)\n");
+	fprintf(out, "  reset         Reset, power-off, or EDL-reboot a device\n");
 	fprintf(out, "  getslot       Show the active A/B slot\n");
 	fprintf(out, "  setslot       Set the active A/B slot (a or b)\n");
 	fprintf(out, "  read          Read partition(s) by label\n");
 	fprintf(out, "  readall       Dump all partitions to files\n");
-	fprintf(out, "  erase         Erase partition(s) by label\n");
+	fprintf(out, "  erase         Erase partition(s) by label or raw sectors\n");
 	fprintf(out, "  eraseall      Erase all partitions on device\n");
 
 	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
-		       "\nDIAG Subcommands");
+		       "\nDIAG Commands");
 	fprintf(out, " (work directly on DIAG port, no programmer needed):\n");
 	fprintf(out, "  diag2edl      Switch a device from DIAG to EDL mode\n");
 	fprintf(out, "  nvread        Read an NV item via DIAG\n");
 	fprintf(out, "  nvwrite       Write an NV item via DIAG\n");
-	fprintf(out, "  efsls         List an EFS directory via DIAG\n");
+
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "\nEFS Commands");
+	fprintf(out, " (EFS filesystem over DIAG, no programmer needed):\n");
+	fprintf(out, "  efsbackup     Backup EFS filesystem to TAR or XQCN format\n");
+	fprintf(out, "  efsrestore    Restore EFS filesystem from TAR or XQCN file\n");
 	fprintf(out, "  efspull       Download a file from EFS\n");
 	fprintf(out, "  efspush       Upload a file to EFS\n");
+	fprintf(out, "  efsls         List an EFS directory\n");
 	fprintf(out, "  efsrm         Delete a file or directory from EFS (-r for recursive)\n");
 	fprintf(out, "  efsstat       Show EFS file/directory information\n");
 	fprintf(out, "  efsmkdir      Create a directory on EFS\n");
@@ -781,27 +790,36 @@ static void print_usage(FILE *out)
 	fprintf(out, "  efsln         Create a symlink on EFS\n");
 	fprintf(out, "  efsrl         Read a symlink target on EFS\n");
 	fprintf(out, "  efsdump       Dump the EFS factory image\n");
-	fprintf(out, "  efsbackup     Backup EFS filesystem to TAR or XQCN format\n");
-	fprintf(out, "  efsrestore    Restore EFS filesystem from TAR or XQCN file\n");
-	fprintf(out, "  xqcn2tar      Convert XQCN backup to TAR archive (offline)\n");
-	fprintf(out, "  tar2xqcn      Convert TAR archive to XQCN format (offline)\n");
 
 	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
-		       "\nOther Subcommands");
+		       "\nConversion Commands");
+	fprintf(out, " (offline, no device needed):\n");
+	fprintf(out, "  xqcn2tar      Convert XQCN backup to TAR archive\n");
+	fprintf(out, "  tar2xqcn      Convert TAR archive to XQCN format\n");
+
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "\nOther Commands");
 	fprintf(out, ":\n");
 	fprintf(out, "  list          List connected EDL, DIAG, and PCIe devices\n");
 	fprintf(out, "  ramdump       Extract RAM dumps via Sahara\n");
 	fprintf(out, "  ks            Keystore/Sahara over serial device nodes\n");
 
 	fprintf(out, "\nUse '%s <subcommand> --help' for detailed subcommand usage.\n", __progname);
+	fprintf(out, "Use '%s --help-all' to show help for all subcommands at once.\n", __progname);
+
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "\nGlobal Options");
+	fprintf(out, " (work with all subcommands):\n");
+	fprintf(out, "      --log=FILE            Write debug-level log to FILE\n");
 
 	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
 		       "\nFlash Options");
 	fprintf(out, ":\n");
 	fprintf(out, "  -d, --debug               Print detailed debug info\n");
 	fprintf(out, "  -n, --dry-run             Dry run, no device reading or flashing\n");
+	fprintf(out, "  -e, --erase-all           Erase all partitions before programming\n");
 	fprintf(out, "  -f, --allow-missing       Allow skipping of missing files\n");
-	fprintf(out, "  -s, --storage=T           Set storage type: emmc|nand|nvme|spinor|ufs (default: ufs)\n");
+	fprintf(out, "  -s, --storage=T           Set storage type: emmc|nand|nvme|spinor|ufs (default: nand)\n");
 	fprintf(out, "  -l, --finalize-provisioning  Provision the target storage\n");
 	fprintf(out, "  -i, --include=T           Set folder T to search for files\n");
 	fprintf(out, "  -S, --serial=T            Target by serial number or COM port name\n");
@@ -816,6 +834,7 @@ static void print_usage(FILE *out)
 	fprintf(out, "  -P, --pcie                Use PCIe/MHI transport instead of USB\n");
 	fprintf(out, "  -v, --version             Print version and exit\n");
 	fprintf(out, "  -h, --help                Print this usage info\n");
+	fprintf(out, "      --help-all            Print help for all subcommands\n");
 
 	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
 		       "\nExamples");
@@ -826,6 +845,9 @@ static void print_usage(FILE *out)
 	fprintf(out, "  %s printgpt                       Print partitions (with loader in current dir)\n", __progname);
 	fprintf(out, "  %s readall -o backup/             Dump all partitions to backup/\n", __progname);
 	fprintf(out, "  %s list                           List connected devices\n", __progname);
+	fprintf(out, "  %s efsbackup -x                   Backup EFS + NV items to XQCN\n", __progname);
+	fprintf(out, "  %s efsrestore backup.xqcn         Restore from XQCN file\n", __progname);
+	fprintf(out, "  %s nvread 550                     Read NV item 550\n", __progname);
 }
 
 /*
@@ -1252,6 +1274,18 @@ static int list_edl_ports(FILE *out)
 
 #endif /* _WIN32 */
 
+static void print_list_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s list\n", __progname);
+	fprintf(out, "\nList connected EDL, DIAG, and PCIe devices.\n");
+	fprintf(out, "\nScans USB (libusb), Linux MHI, and Windows COM ports.\n");
+	fprintf(out, "Classifies each port as EDL or DIAG by VID/PID or friendly name.\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s list\n", __progname);
+}
+
 static int qdl_list(FILE *out)
 {
 	int found = 0;
@@ -1289,6 +1323,24 @@ static int qdl_list(FILE *out)
 	return found ? 0 : 1;
 }
 
+static void print_ramdump_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s ramdump [options] [filter]\n", __progname);
+	fprintf(out, "\nExtract RAM dumps from a device via Sahara protocol.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -o, --output=DIR      Output directory for dumps (default: .)\n");
+	fprintf(out, "  -S, --serial=T        Target by serial number or COM port name\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -v, --version         Print version and exit\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nIf [filter] is given, only dump regions matching the filter.\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s ramdump -o dumps/\n", __progname);
+	fprintf(out, "  %s ramdump -o dumps/ CODERAM\n", __progname);
+}
+
 static int qdl_ramdump(int argc, char **argv)
 {
 	struct qdl_device *qdl;
@@ -1322,10 +1374,10 @@ static int qdl_ramdump(int argc, char **argv)
 			serial = optarg;
 			break;
 		case 'h':
-			print_usage(stdout);
+			print_ramdump_help(stdout);
 			return 0;
 		default:
-			print_usage(stderr);
+			print_ramdump_help(stderr);
 			return 1;
 		}
 	}
@@ -1334,7 +1386,7 @@ static int qdl_ramdump(int argc, char **argv)
 		filter = argv[optind++];
 
 	if (optind != argc) {
-		print_usage(stderr);
+		print_ramdump_help(stderr);
 		return 1;
 	}
 
@@ -1387,24 +1439,20 @@ static int ks_write(struct qdl_device *qdl, const void *buf, size_t len,
 	return write(qdl->fd, buf, len);
 }
 
-static void print_ks_usage(FILE *out)
+static void print_ks_help(FILE *out)
 {
 	extern const char *__progname;
 
-	fprintf(out,
-		"%s ks -p <sahara dev_node> -s <id:file path> ...\n",
-		__progname);
-	fprintf(out,
-		" -h                   --help                      Print this usage info\n"
-		" -p                   --port                      Sahara device node to use\n"
-		" -s <id:file path>    --sahara <id:file path>     Sahara protocol file mapping\n"
-		"\n"
-		"One -p instance is required.  One or more -s instances are required.\n"
-		"\n"
-		"Example:\n"
-		"%s ks -p /dev/mhi0_QAIC_SAHARA -s 1:/opt/qti-aic/firmware/fw1.bin"
-		" -s 2:/opt/qti-aic/firmware/fw2.bin\n",
-		__progname);
+	fprintf(out, "Usage: %s ks -p <device_node> -s <id:filepath> [...] [options]\n", __progname);
+	fprintf(out, "\nKeystore/Sahara utility for serial device nodes.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -p, --port=NODE       Sahara device node (required)\n");
+	fprintf(out, "  -s, --sahara=ID:FILE  File mapping for Sahara protocol (one or more)\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nOne -p instance is required.  One or more -s instances are required.\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s ks -p /dev/mhi0_QAIC_SAHARA -s 1:fw1.bin -s 2:fw2.bin\n", __progname);
 }
 
 static int qdl_ks(int argc, char **argv)
@@ -1444,7 +1492,7 @@ static int qdl_ks(int argc, char **argv)
 			found_mapping = true;
 			file_id = strtol(optarg, NULL, 10);
 			if (file_id < 0) {
-				print_ks_usage(stderr);
+				print_ks_help(stderr);
 				return 1;
 			}
 			if (file_id >= MAPPING_SZ) {
@@ -1456,7 +1504,7 @@ static int qdl_ks(int argc, char **argv)
 			}
 			colon = strchr(optarg, ':');
 			if (!colon) {
-				print_ks_usage(stderr);
+				print_ks_help(stderr);
 				return 1;
 			}
 			filename = &optarg[colon - optarg + 1];
@@ -1468,16 +1516,16 @@ static int qdl_ks(int argc, char **argv)
 			       file_id, filename);
 			break;
 		case 'h':
-			print_ks_usage(stdout);
+			print_ks_help(stdout);
 			return 0;
 		default:
-			print_ks_usage(stderr);
+			print_ks_help(stderr);
 			return 1;
 		}
 	}
 
 	if (!dev_node || !found_mapping) {
-		print_ks_usage(stderr);
+		print_ks_help(stderr);
 		return 1;
 	}
 
@@ -1502,17 +1550,19 @@ static int qdl_ks(int argc, char **argv)
 	return 0;
 }
 
-static void print_diag2edl_usage(FILE *out)
+static void print_diag2edl_help(FILE *out)
 {
 	extern const char *__progname;
 
 	fprintf(out, "Usage: %s diag2edl [options]\n", __progname);
 	fprintf(out, "\nSwitch a device from DIAG mode to EDL mode.\n");
 	fprintf(out, "\nOptions:\n");
-	fprintf(out, " -d, --debug\t\tPrint detailed debug info\n");
-	fprintf(out, " -v, --version\t\tPrint the current version and exit\n");
-	fprintf(out, " -S, --serial=T\t\tSelect target by serial number T\n");
-	fprintf(out, " -h, --help\t\tPrint this usage info\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s diag2edl\n", __progname);
+	fprintf(out, "  %s diag2edl -S /dev/ttyUSB0\n", __progname);
 }
 
 static int qdl_diag2edl(int argc, char **argv)
@@ -1540,10 +1590,10 @@ static int qdl_diag2edl(int argc, char **argv)
 			serial = optarg;
 			break;
 		case 'h':
-			print_diag2edl_usage(stdout);
+			print_diag2edl_help(stdout);
 			return 0;
 		default:
-			print_diag2edl_usage(stderr);
+			print_diag2edl_help(stderr);
 			return 1;
 		}
 	}
@@ -1728,9 +1778,31 @@ static void firehose_session_close(struct qdl_device *qdl, bool do_reset)
 	qdl_deinit(qdl);
 }
 
+static void print_printgpt_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s printgpt [-L dir | <programmer>] [options]\n", __progname);
+	fprintf(out, "\nPrint GPT or NAND partition tables from a live device.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  --make-xml=read       Generate rawread XML from partition table\n");
+	fprintf(out, "  --make-xml=program    Generate rawprogram XML from partition table\n");
+	fprintf(out, "  -o, --output=DIR      Output directory for generated XMLs (default: .)\n");
+	fprintf(out, "  -s, --storage=T       Storage type: emmc|nand|ufs (default: nand)\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -L, --find-loader=DIR Find programmer in directory\n");
+	fprintf(out, "  -P, --pcie            Use PCIe/MHI transport\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s printgpt\n", __progname);
+	fprintf(out, "  %s printgpt -L /path/to/loader/\n", __progname);
+	fprintf(out, "  %s printgpt --make-xml=read --make-xml=program -o xmls/\n", __progname);
+}
+
 static int qdl_printgpt(int argc, char **argv)
 {
-	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
+	enum qdl_storage_type storage_type = QDL_STORAGE_NAND;
 	struct qdl_device *qdl = NULL;
 	char *loader_dir = NULL;
 	char *programmer = NULL;
@@ -1791,15 +1863,11 @@ static int qdl_printgpt(int argc, char **argv)
 			use_pcie = true;
 			break;
 		case 'h':
+			print_printgpt_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr, "Usage: qfenix printgpt [-L dir | <programmer>] [options]\n"
-				"  --make-xml=read       Generate rawread XML from partition table\n"
-				"  --make-xml=program    Generate rawprogram XML from partition table\n"
-				"  -o, --output=DIR      Output directory for generated XMLs (default: .)\n"
-				"  -S, --serial=S        Target by serial number or COM port\n"
-				"  -s, --storage=T       Set storage type: emmc|nand|ufs\n"
-				"  -P, --pcie            Use PCIe/MHI transport\n");
-			return opt == 'h' ? 0 : 1;
+			print_printgpt_help(stderr);
+			return 1;
 		}
 	}
 
@@ -1833,9 +1901,27 @@ static int qdl_printgpt(int argc, char **argv)
 	return !!ret;
 }
 
+static void print_storageinfo_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s storageinfo [-L dir | <programmer>] [options]\n", __progname);
+	fprintf(out, "\nQuery storage hardware information from the device.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -s, --storage=T       Storage type: emmc|nand|ufs (default: nand)\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -L, --find-loader=DIR Find programmer in directory\n");
+	fprintf(out, "  -P, --pcie            Use PCIe/MHI transport\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s storageinfo\n", __progname);
+	fprintf(out, "  %s storageinfo -L /path/to/loader/\n", __progname);
+}
+
 static int qdl_storageinfo(int argc, char **argv)
 {
-	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
+	enum qdl_storage_type storage_type = QDL_STORAGE_NAND;
 	struct storage_info info;
 	struct qdl_device *qdl = NULL;
 	char *loader_dir = NULL;
@@ -1879,9 +1965,11 @@ static int qdl_storageinfo(int argc, char **argv)
 			use_pcie = true;
 			break;
 		case 'h':
+			print_storageinfo_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr, "Usage: qfenix storageinfo [-L dir | <programmer>] [--serial=S] [--storage=T] [--pcie]\n");
-			return opt == 'h' ? 0 : 1;
+			print_storageinfo_help(stderr);
+			return 1;
 		}
 	}
 
@@ -1931,9 +2019,29 @@ static int qdl_storageinfo(int argc, char **argv)
 	return !!ret;
 }
 
+static void print_reset_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s reset [-L dir | <programmer>] [options]\n", __progname);
+	fprintf(out, "\nReset, power-off, or EDL-reboot a device in EDL mode.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -m, --mode=MODE       reset|off|edl (default: reset)\n");
+	fprintf(out, "  -s, --storage=T       Storage type: emmc|nand|ufs (default: nand)\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -L, --find-loader=DIR Find programmer in directory\n");
+	fprintf(out, "  -P, --pcie            Use PCIe/MHI transport\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s reset\n", __progname);
+	fprintf(out, "  %s reset --mode=off\n", __progname);
+	fprintf(out, "  %s reset --mode=edl\n", __progname);
+}
+
 static int qdl_reset(int argc, char **argv)
 {
-	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
+	enum qdl_storage_type storage_type = QDL_STORAGE_NAND;
 	struct qdl_device *qdl = NULL;
 	const char *mode = "reset";
 	char *loader_dir = NULL;
@@ -1981,9 +2089,11 @@ static int qdl_reset(int argc, char **argv)
 			use_pcie = true;
 			break;
 		case 'h':
+			print_reset_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr, "Usage: qfenix reset [-L dir | <programmer>] [--mode=reset|off|edl] [--serial=S] [--storage=T] [--pcie]\n");
-			return opt == 'h' ? 0 : 1;
+			print_reset_help(stderr);
+			return 1;
 		}
 	}
 
@@ -2016,9 +2126,26 @@ static int qdl_reset(int argc, char **argv)
 	return !!ret;
 }
 
+static void print_getslot_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s getslot [-L dir | <programmer>] [options]\n", __progname);
+	fprintf(out, "\nShow the active A/B slot on the device.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -s, --storage=T       Storage type: emmc|nand|ufs (default: nand)\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -L, --find-loader=DIR Find programmer in directory\n");
+	fprintf(out, "  -P, --pcie            Use PCIe/MHI transport\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s getslot\n", __progname);
+}
+
 static int qdl_getslot(int argc, char **argv)
 {
-	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
+	enum qdl_storage_type storage_type = QDL_STORAGE_NAND;
 	struct qdl_device *qdl = NULL;
 	char *loader_dir = NULL;
 	char *programmer = NULL;
@@ -2062,9 +2189,11 @@ static int qdl_getslot(int argc, char **argv)
 			use_pcie = true;
 			break;
 		case 'h':
+			print_getslot_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr, "Usage: qfenix getslot [-L dir | <programmer>] [--serial=S] [--storage=T] [--pcie]\n");
-			return opt == 'h' ? 0 : 1;
+			print_getslot_help(stderr);
+			return 1;
 		}
 	}
 
@@ -2099,9 +2228,27 @@ static int qdl_getslot(int argc, char **argv)
 	return slot > 0 ? 0 : 1;
 }
 
+static void print_setslot_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s setslot <a|b> [-L dir | <programmer>] [options]\n", __progname);
+	fprintf(out, "\nSet the active A/B slot on the device.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -s, --storage=T       Storage type: emmc|nand|ufs (default: nand)\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -L, --find-loader=DIR Find programmer in directory\n");
+	fprintf(out, "  -P, --pcie            Use PCIe/MHI transport\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s setslot a\n", __progname);
+	fprintf(out, "  %s setslot b\n", __progname);
+}
+
 static int qdl_setslot(int argc, char **argv)
 {
-	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
+	enum qdl_storage_type storage_type = QDL_STORAGE_NAND;
 	struct qdl_device *qdl = NULL;
 	char *loader_dir = NULL;
 	char *programmer = NULL;
@@ -2145,9 +2292,11 @@ static int qdl_setslot(int argc, char **argv)
 			use_pcie = true;
 			break;
 		case 'h':
+			print_setslot_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr, "Usage: qfenix setslot <a|b> [-L dir | <programmer>] [--serial=S] [--storage=T] [--pcie]\n");
-			return opt == 'h' ? 0 : 1;
+			print_setslot_help(stderr);
+			return 1;
 		}
 	}
 
@@ -2192,9 +2341,32 @@ static int qdl_setslot(int argc, char **argv)
 	return !!ret;
 }
 
+static void print_read_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s read <label> [label2 ...] [-L dir | <programmer>] [options]\n", __progname);
+	fprintf(out, "\nRead partitions by label from a device in EDL mode.\n");
+	fprintf(out, "\nWith one label, -o is an output file path.\n");
+	fprintf(out, "With multiple labels, -o is a directory (auto-named files).\n");
+	fprintf(out, "If -o is omitted, output to the loader directory (or current directory).\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -o, --output=PATH     Output file or directory\n");
+	fprintf(out, "  -s, --storage=T       Storage type: emmc|nand|ufs (default: nand)\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -L, --find-loader=DIR Find programmer in directory\n");
+	fprintf(out, "  -P, --pcie            Use PCIe/MHI transport\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s read modem -o modem.bin\n", __progname);
+	fprintf(out, "  %s read sbl1 tz modem -o backup/\n", __progname);
+	fprintf(out, "  %s read system\n", __progname);
+}
+
 static int qdl_read_partition(int argc, char **argv)
 {
-	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
+	enum qdl_storage_type storage_type = QDL_STORAGE_NAND;
 	struct qdl_device *qdl = NULL;
 	const char *output = NULL;
 	char *loader_dir = NULL;
@@ -2246,14 +2418,11 @@ static int qdl_read_partition(int argc, char **argv)
 			use_pcie = true;
 			break;
 		case 'h':
+			print_read_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr,
-				"Usage: qfenix read <label> [label2 ...] [-L dir | <programmer>] [-o output] [--serial=S] [--storage=T] [--pcie]\n"
-				"\nRead partitions by label.\n"
-				"With one label, -o is an output file path.\n"
-				"With multiple labels, -o is a directory (auto-named files with detected extensions).\n"
-				"If -o is omitted, output to the loader directory (or current directory).\n");
-			return opt == 'h' ? 0 : 1;
+			print_read_help(stderr);
+			return 1;
 		}
 	}
 
@@ -2334,9 +2503,29 @@ static int qdl_read_partition(int argc, char **argv)
 	return !!ret;
 }
 
+static void print_readall_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s readall [-L dir | <programmer>] [options]\n", __progname);
+	fprintf(out, "\nDump all partitions to individual files.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -o, --output=DIR        Output directory (default: .)\n");
+	fprintf(out, "      --single-file=FILE  Dump entire storage as one file\n");
+	fprintf(out, "  -s, --storage=T         Storage type: emmc|nand|ufs (default: nand)\n");
+	fprintf(out, "  -S, --serial=S          Target by serial number or COM port\n");
+	fprintf(out, "  -L, --find-loader=DIR   Find programmer in directory\n");
+	fprintf(out, "  -P, --pcie              Use PCIe/MHI transport\n");
+	fprintf(out, "  -d, --debug             Print detailed debug info\n");
+	fprintf(out, "  -h, --help              Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s readall -o backup/\n", __progname);
+	fprintf(out, "  %s readall --single-file=full_dump.bin\n", __progname);
+}
+
 static int qdl_readall(int argc, char **argv)
 {
-	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
+	enum qdl_storage_type storage_type = QDL_STORAGE_NAND;
 	struct qdl_device *qdl = NULL;
 	const char *outdir = ".";
 	const char *single_file = NULL;
@@ -2389,11 +2578,11 @@ static int qdl_readall(int argc, char **argv)
 			single_file = optarg;
 			break;
 		case 'h':
+			print_readall_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr,
-				"Usage: qfenix readall [-L dir | <programmer>] [-o outdir] [--single-file=FILE] [--serial=S] [--storage=T] [--pcie]\n"
-				"\n  --single-file=FILE  Dump entire storage as one file (for full restore)\n");
-			return opt == 'h' ? 0 : 1;
+			print_readall_help(stderr);
+			return 1;
 		}
 	}
 
@@ -2425,6 +2614,24 @@ static int qdl_readall(int argc, char **argv)
 	firehose_session_close(qdl, true);
 	free(programmer);
 	return !!ret;
+}
+
+static void print_nvread_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s nvread <item_id> [options]\n", __progname);
+	fprintf(out, "\nRead an NV item from the device via DIAG protocol.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -I, --index=N         Subscription index for indexed NV items\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nThe <item_id> can be decimal or hex (0x prefix).\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s nvread 550\n", __progname);
+	fprintf(out, "  %s nvread 0x226\n", __progname);
+	fprintf(out, "  %s nvread 550 --index=1\n", __progname);
 }
 
 static int qdl_nvread(int argc, char **argv)
@@ -2461,9 +2668,11 @@ static int qdl_nvread(int argc, char **argv)
 			index = (int)strtol(optarg, NULL, 0);
 			break;
 		case 'h':
+			print_nvread_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr, "Usage: qfenix nvread <item_id> [--index=N] [--serial=S] [--debug]\n");
-			return opt == 'h' ? 0 : 1;
+			print_nvread_help(stderr);
+			return 1;
 		}
 	}
 
@@ -2497,6 +2706,24 @@ static int qdl_nvread(int argc, char **argv)
 
 	diag_close(sess);
 	return !!ret;
+}
+
+static void print_nvwrite_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s nvwrite <item_id> <hex_data> [options]\n", __progname);
+	fprintf(out, "\nWrite an NV item to the device via DIAG protocol.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -I, --index=N         Subscription index for indexed NV items\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nThe <hex_data> is a hex string (e.g. 01020304). Remaining bytes\n");
+	fprintf(out, "are zero-padded to 128 bytes.\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s nvwrite 550 0102030405060708\n", __progname);
+	fprintf(out, "  %s nvwrite 0x226 FF --index=1\n", __progname);
 }
 
 static int qdl_nvwrite(int argc, char **argv)
@@ -2536,9 +2763,11 @@ static int qdl_nvwrite(int argc, char **argv)
 			index = (int)strtol(optarg, NULL, 0);
 			break;
 		case 'h':
+			print_nvwrite_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr, "Usage: qfenix nvwrite <item_id> <hex_data> [--index=N] [--serial=S] [--debug]\n");
-			return opt == 'h' ? 0 : 1;
+			print_nvwrite_help(stderr);
+			return 1;
 		}
 	}
 
@@ -2572,13 +2801,15 @@ static int qdl_nvwrite(int argc, char **argv)
 	else
 		ret = diag_nv_write(sess, item_id, data, data_len);
 
-	if (ret == 0)
+	if (ret == 0) {
 		printf("NV item %u written successfully\n", item_id);
-	else if (ret > 0)
+		printf("Reboot modem for changes to take effect\n");
+	} else if (ret > 0) {
 		fprintf(stderr, "NV item %u: %s\n", item_id,
 			diag_nv_status_str((uint16_t)ret));
-	else
+	} else {
 		fprintf(stderr, "NV item %u: protocol error\n", item_id);
+	}
 
 	diag_close(sess);
 	return (ret != 0) ? 1 : 0;
@@ -2590,13 +2821,32 @@ static void efsls_print_entry(const struct efs_dirent *entry, void *ctx)
 
 	(void)ctx;
 
-	if (entry->entry_type == 1)
-		type_str = (entry->mode & 0040000) ? "dir" : "file";
+	if (entry->mode & 0040000)
+		type_str = "dir";
+	else if ((entry->mode & 0170000) == EFS_S_IFITM)
+		type_str = "item";
+	else if (entry->entry_type == 2)
+		type_str = "link";
 	else
-		type_str = "???";
+		type_str = "file";
 
 	printf("%-4s %8d  %04o  %s\n",
 	       type_str, entry->size, entry->mode & 0777, entry->name);
+}
+
+static void print_efsls_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s efsls <path> [options]\n", __progname);
+	fprintf(out, "\nList contents of an EFS directory.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s efsls /\n", __progname);
+	fprintf(out, "  %s efsls /nv/item_files/modem/\n", __progname);
 }
 
 static int qdl_efsls(int argc, char **argv)
@@ -2627,9 +2877,11 @@ static int qdl_efsls(int argc, char **argv)
 			serial = optarg;
 			break;
 		case 'h':
+			print_efsls_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr, "Usage: qfenix efsls <path> [--serial=S] [--debug]\n");
-			return opt == 'h' ? 0 : 1;
+			print_efsls_help(stderr);
+			return 1;
 		}
 	}
 
@@ -2654,6 +2906,22 @@ static int qdl_efsls(int argc, char **argv)
 	diag_online(sess);
 	diag_close(sess);
 	return !!ret;
+}
+
+static void print_efspull_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s efspull <remote_path> <local_path> [options]\n", __progname);
+	fprintf(out, "\nDownload a file from the device EFS filesystem.\n");
+	fprintf(out, "\nAlso supports NV item paths (e.g. nv_items/550.bin).\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s efspull /nv/item_files/rfnv/00024955 rfnv_24955.bin\n", __progname);
+	fprintf(out, "  %s efspull nv_items/550.bin nv550.bin\n", __progname);
 }
 
 static int qdl_efspull(int argc, char **argv)
@@ -2685,9 +2953,11 @@ static int qdl_efspull(int argc, char **argv)
 			serial = optarg;
 			break;
 		case 'h':
+			print_efspull_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr, "Usage: qfenix efspull <remote_path> <local_path> [--serial=S] [--debug]\n");
-			return opt == 'h' ? 0 : 1;
+			print_efspull_help(stderr);
+			return 1;
 		}
 	}
 
@@ -2704,11 +2974,74 @@ static int qdl_efspull(int argc, char **argv)
 		return 1;
 
 	diag_offline(sess);
+
+	{
+		const char *nv_str = NULL;
+		uint32_t nv_id;
+
+		/* Detect nv_items/NNNNN.bin paths from TAR extraction */
+		if (strncmp(src, "nv_items/", 9) == 0)
+			nv_str = src + 9;
+		else if (strncmp(src, "/nv_items/", 10) == 0)
+			nv_str = src + 10;
+
+		if (nv_str && sscanf(nv_str, "%u", &nv_id) == 1) {
+			struct nv_item nv;
+			int local_fd;
+
+			ret = diag_nv_read(sess, (uint16_t)nv_id, &nv);
+			if (ret != 0) {
+				fprintf(stderr, "NV %u read: %s\n", nv_id,
+					nv.status ?
+					diag_nv_status_str(nv.status) :
+					"failed");
+				diag_online(sess);
+				diag_close(sess);
+				return 1;
+			}
+
+			local_fd = open(dst,
+					O_WRONLY | O_CREAT | O_TRUNC |
+					O_BINARY, 0644);
+			if (local_fd < 0) {
+				fprintf(stderr, "Error: cannot create %s: %s\n",
+					dst, strerror(errno));
+				diag_online(sess);
+				diag_close(sess);
+				return 1;
+			}
+			if (write(local_fd, nv.data, NV_ITEM_DATA_SIZE) !=
+			    NV_ITEM_DATA_SIZE)
+				fprintf(stderr, "warning: write to %s truncated\n",
+					dst);
+			close(local_fd);
+			printf("NV item %u saved to %s (128 bytes)\n",
+			       nv_id, dst);
+			diag_online(sess);
+			diag_close(sess);
+			return 0;
+		}
+	}
+
 	ret = diag_efs_readfile(sess, src, dst);
 
 	diag_online(sess);
 	diag_close(sess);
 	return !!ret;
+}
+
+static void print_efsdump_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s efsdump <output_file> [options]\n", __progname);
+	fprintf(out, "\nDump the EFS factory image via modem FS_IMAGE opcodes.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s efsdump efs_image.bin\n", __progname);
 }
 
 static int qdl_efsdump(int argc, char **argv)
@@ -2739,9 +3072,11 @@ static int qdl_efsdump(int argc, char **argv)
 			serial = optarg;
 			break;
 		case 'h':
+			print_efsdump_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr, "Usage: qfenix efsdump <output_file> [--serial=S] [--debug]\n");
-			return opt == 'h' ? 0 : 1;
+			print_efsdump_help(stderr);
+			return 1;
 		}
 	}
 
@@ -2762,6 +3097,22 @@ static int qdl_efsdump(int argc, char **argv)
 	diag_online(sess);
 	diag_close(sess);
 	return !!ret;
+}
+
+static void print_efspush_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s efspush <local_file> <efs_path> [options]\n", __progname);
+	fprintf(out, "\nUpload a local file to the device EFS filesystem.\n");
+	fprintf(out, "\nAlso supports NV item paths (e.g. nv_items/550.bin).\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s efspush local.bin /nv/item_files/rfnv/00024955\n", __progname);
+	fprintf(out, "  %s efspush nv550.bin nv_items/550.bin\n", __progname);
 }
 
 static int qdl_efspush(int argc, char **argv)
@@ -2791,11 +3142,11 @@ static int qdl_efspush(int argc, char **argv)
 			serial = optarg;
 			break;
 		case 'h':
+			print_efspush_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr,
-				"Usage: qfenix efspush <local_file> <efs_path> [--serial=S]\n"
-				"\nUpload a local file to the device EFS filesystem.\n");
-			return opt == 'h' ? 0 : 1;
+			print_efspush_help(stderr);
+			return 1;
 		}
 	}
 
@@ -2809,11 +3160,80 @@ static int qdl_efspush(int argc, char **argv)
 		return 1;
 
 	diag_offline(sess);
+
+	{
+		const char *efs_path = argv[optind + 1];
+		const char *nv_str = NULL;
+		uint32_t nv_id;
+
+		/* Detect nv_items/NNNNN.bin paths from TAR extraction */
+		if (strncmp(efs_path, "nv_items/", 9) == 0)
+			nv_str = efs_path + 9;
+		else if (strncmp(efs_path, "/nv_items/", 10) == 0)
+			nv_str = efs_path + 10;
+
+		if (nv_str && sscanf(nv_str, "%u", &nv_id) == 1) {
+			uint8_t nv_data[NV_ITEM_DATA_SIZE];
+			int local_fd = open(argv[optind],
+					    O_RDONLY | O_BINARY);
+
+			if (local_fd < 0) {
+				fprintf(stderr, "Error: cannot open %s: %s\n",
+					argv[optind], strerror(errno));
+				diag_online(sess);
+				diag_close(sess);
+				return 1;
+			}
+
+			memset(nv_data, 0, sizeof(nv_data));
+			if (read(local_fd, nv_data, NV_ITEM_DATA_SIZE) <= 0)
+				fprintf(stderr, "warning: read from %s failed\n",
+					argv[optind]);
+			close(local_fd);
+
+			ret = diag_nv_write(sess, (uint16_t)nv_id,
+					    nv_data, NV_ITEM_DATA_SIZE);
+			if (ret == 0) {
+				printf("NV item %u written successfully\n",
+				       nv_id);
+				printf("Reboot modem for changes to take effect\n");
+			} else if (ret > 0) {
+				fprintf(stderr, "NV %u write: %s\n",
+					nv_id,
+					diag_nv_status_str((uint16_t)ret));
+			} else {
+				fprintf(stderr, "NV %u write failed\n", nv_id);
+			}
+
+			diag_online(sess);
+			diag_close(sess);
+			return ret != 0;
+		}
+	}
+
 	ret = diag_efs_put(sess, argv[optind], argv[optind + 1]);
+	if (ret == 0)
+		printf("Reboot modem for changes to take effect\n");
 
 	diag_online(sess);
 	diag_close(sess);
 	return !!ret;
+}
+
+static void print_efsrm_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s efsrm [-r] <path> [path2 ...] [options]\n", __progname);
+	fprintf(out, "\nDelete file(s) or directories from EFS.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -r, --recursive       Recursively remove directories\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s efsrm /policyman/net_policy_info.xml\n", __progname);
+	fprintf(out, "  %s efsrm -r /nv/item_files/ims/\n", __progname);
 }
 
 static int qdl_efsrm(int argc, char **argv)
@@ -2850,13 +3270,11 @@ static int qdl_efsrm(int argc, char **argv)
 			recursive = true;
 			break;
 		case 'h':
+			print_efsrm_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr,
-				"Usage: qfenix efsrm [-r] <path> [path2 ...] [--serial=S]\n"
-				"\nDelete file(s) or directories from EFS.\n"
-				"\nOptions:\n"
-				"  -r, --recursive   Recursively remove directories\n");
-			return opt == 'h' ? 0 : 1;
+			print_efsrm_help(stderr);
+			return 1;
 		}
 	}
 
@@ -2877,6 +3295,9 @@ static int qdl_efsrm(int argc, char **argv)
 			failed++;
 	}
 
+	if (failed < (argc - optind))
+		printf("Reboot modem for changes to take effect\n");
+
 	diag_online(sess);
 	diag_close(sess);
 	return !!failed;
@@ -2886,7 +3307,9 @@ static const char *mode_string(int32_t mode)
 {
 	static char buf[11];
 
-	buf[0] = S_ISDIR(mode) ? 'd' : S_ISLNK(mode) ? 'l' : '-';
+	buf[0] = S_ISDIR(mode) ? 'd' :
+		S_ISLNK(mode) ? 'l' :
+		(mode & 0170000) == EFS_S_IFITM ? 'i' : '-';
 	buf[1] = (mode & 0400) ? 'r' : '-';
 	buf[2] = (mode & 0200) ? 'w' : '-';
 	buf[3] = (mode & 0100) ? 'x' : '-';
@@ -2899,6 +3322,21 @@ static const char *mode_string(int32_t mode)
 	buf[10] = '\0';
 
 	return buf;
+}
+
+static void print_efsstat_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s efsstat <path> [path2 ...] [options]\n", __progname);
+	fprintf(out, "\nShow file/directory information from EFS.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s efsstat /nv/item_files/rfnv/00024955\n", __progname);
+	fprintf(out, "  %s efsstat /policyman/ /nv/\n", __progname);
 }
 
 static int qdl_efsstat(int argc, char **argv)
@@ -2930,11 +3368,11 @@ static int qdl_efsstat(int argc, char **argv)
 			serial = optarg;
 			break;
 		case 'h':
+			print_efsstat_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr,
-				"Usage: qfenix efsstat <path> [path2 ...] [--serial=S]\n"
-				"\nShow file/directory information from EFS.\n");
-			return opt == 'h' ? 0 : 1;
+			print_efsstat_help(stderr);
+			return 1;
 		}
 	}
 
@@ -2963,6 +3401,7 @@ static int qdl_efsstat(int argc, char **argv)
 		printf("  Type: %s\n",
 		       S_ISDIR(st.mode) ? "directory" :
 		       S_ISLNK(st.mode) ? "symlink" :
+		       (st.mode & 0170000) == EFS_S_IFITM ? "item file" :
 		       S_ISREG(st.mode) ? "regular file" : "other");
 		printf(" Atime: %d\n", st.atime);
 		printf(" Mtime: %d\n", st.mtime);
@@ -2975,6 +3414,22 @@ static int qdl_efsstat(int argc, char **argv)
 	diag_online(sess);
 	diag_close(sess);
 	return 0;
+}
+
+static void print_efsmkdir_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s efsmkdir [-m mode] <path> [path2 ...] [options]\n", __progname);
+	fprintf(out, "\nCreate directories on the EFS filesystem.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -m, --mode=MODE       Octal permission mode (default: 0755)\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s efsmkdir /my_data/\n", __progname);
+	fprintf(out, "  %s efsmkdir -m 0700 /my_data/private/\n", __progname);
 }
 
 static int qdl_efsmkdir(int argc, char **argv)
@@ -3011,13 +3466,11 @@ static int qdl_efsmkdir(int argc, char **argv)
 			mode = (int16_t)strtol(optarg, NULL, 8);
 			break;
 		case 'h':
+			print_efsmkdir_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr,
-				"Usage: qfenix efsmkdir [-m mode] <path> [path2 ...] [--serial=S]\n"
-				"\nCreate directories on the EFS filesystem.\n"
-				"\nOptions:\n"
-				"  -m, --mode=MODE   Octal permission mode (default: 0755)\n");
-			return opt == 'h' ? 0 : 1;
+			print_efsmkdir_help(stderr);
+			return 1;
 		}
 	}
 
@@ -3045,6 +3498,22 @@ static int qdl_efsmkdir(int argc, char **argv)
 	diag_online(sess);
 	diag_close(sess);
 	return !!failed;
+}
+
+static void print_efschmod_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s efschmod <mode> <path> [path2 ...] [options]\n", __progname);
+	fprintf(out, "\nChange EFS file/directory permissions.\n");
+	fprintf(out, "\n  <mode> is an octal permission value (e.g. 0644, 0755).\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s efschmod 0644 /nv/item_files/rfnv/00024955\n", __progname);
+	fprintf(out, "  %s efschmod 0755 /policyman/\n", __progname);
 }
 
 static int qdl_efschmod(int argc, char **argv)
@@ -3077,12 +3546,11 @@ static int qdl_efschmod(int argc, char **argv)
 			serial = optarg;
 			break;
 		case 'h':
+			print_efschmod_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr,
-				"Usage: qfenix efschmod <mode> <path> [path2 ...] [--serial=S]\n"
-				"\nChange EFS file/directory permissions.\n"
-				"\n  <mode> is an octal permission value (e.g. 0644, 0755)\n");
-			return opt == 'h' ? 0 : 1;
+			print_efschmod_help(stderr);
+			return 1;
 		}
 	}
 
@@ -3114,6 +3582,20 @@ static int qdl_efschmod(int argc, char **argv)
 	return !!failed;
 }
 
+static void print_efsln_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s efsln <target> <linkpath> [options]\n", __progname);
+	fprintf(out, "\nCreate a symlink on the EFS filesystem.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s efsln /nv/item_files/data /data_link\n", __progname);
+}
+
 static int qdl_efsln(int argc, char **argv)
 {
 	struct diag_session *sess;
@@ -3141,11 +3623,11 @@ static int qdl_efsln(int argc, char **argv)
 			serial = optarg;
 			break;
 		case 'h':
+			print_efsln_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr,
-				"Usage: qfenix efsln <target> <linkpath> [--serial=S]\n"
-				"\nCreate a symlink on the EFS filesystem.\n");
-			return opt == 'h' ? 0 : 1;
+			print_efsln_help(stderr);
+			return 1;
 		}
 	}
 
@@ -3167,6 +3649,20 @@ static int qdl_efsln(int argc, char **argv)
 	diag_online(sess);
 	diag_close(sess);
 	return !!ret;
+}
+
+static void print_efsrl_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s efsrl <path> [path2 ...] [options]\n", __progname);
+	fprintf(out, "\nRead symlink target(s) on the EFS filesystem.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s efsrl /data_link\n", __progname);
 }
 
 static int qdl_efsrl(int argc, char **argv)
@@ -3198,11 +3694,11 @@ static int qdl_efsrl(int argc, char **argv)
 			serial = optarg;
 			break;
 		case 'h':
+			print_efsrl_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr,
-				"Usage: qfenix efsrl <path> [path2 ...] [--serial=S]\n"
-				"\nRead symlink target(s) on the EFS filesystem.\n");
-			return opt == 'h' ? 0 : 1;
+			print_efsrl_help(stderr);
+			return 1;
 		}
 	}
 
@@ -3229,6 +3725,31 @@ static int qdl_efsrl(int argc, char **argv)
 	diag_online(sess);
 	diag_close(sess);
 	return 0;
+}
+
+static void print_efsbackup_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s efsbackup [-o FILE] [-x] [--quick] [path] [options]\n", __progname);
+	fprintf(out, "\nBackup EFS filesystem to TAR or XQCN format.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -o, --output=FILE     Output file (default: efs_backup.tar or .xqcn)\n");
+	fprintf(out, "  -x, --xqcn           Generate XQCN format (includes NV items)\n");
+	fprintf(out, "  -q, --quick          Skip probe walk (tree walk only, faster)\n");
+	fprintf(out, "  -m, --manual         Force manual tree walk (skip modem TAR generation)\n");
+	fprintf(out, "  -S, --serial=S       Target device by serial/port\n");
+	fprintf(out, "  -d, --debug          Print detailed debug info\n");
+	fprintf(out, "  -h, --help           Print this help\n");
+	fprintf(out, "\nDefault TAR backup probes known paths for comprehensive coverage.\n");
+	fprintf(out, "Use --quick for fast tree-walk-only backup.\n");
+	fprintf(out, "Use -x for QPST-compatible XQCN format (slower, scans NV items).\n");
+	fprintf(out, "\nIf [path] is given, only that EFS subtree is backed up (default: /).\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s efsbackup\n", __progname);
+	fprintf(out, "  %s efsbackup -x -o my_backup.xqcn\n", __progname);
+	fprintf(out, "  %s efsbackup --quick -o quick.tar\n", __progname);
+	fprintf(out, "  %s efsbackup /nv/item_files/ -o nv_only.tar\n", __progname);
 }
 
 static int qdl_efsbackup(int argc, char **argv)
@@ -3280,22 +3801,11 @@ static int qdl_efsbackup(int argc, char **argv)
 			quick = true;
 			break;
 		case 'h':
+			print_efsbackup_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr,
-				"Usage: qfenix efsbackup [-o FILE] [-x] [--quick] [path] [-S serial]\n"
-				"\nBackup EFS filesystem to TAR or XQCN format.\n"
-				"\nOptions:\n"
-				"  -o, --output=FILE   Output file (default: efs_backup.tar or .xqcn)\n"
-				"  -x, --xqcn          Generate XQCN format (includes NV items)\n"
-				"  -q, --quick         Skip probe walk (tree walk only, faster)\n"
-				"  -m, --manual        Force manual tree walk (skip modem TAR generation)\n"
-				"  -S, --serial=S      Target device by serial/port\n"
-				"  -d, --debug         Print detailed debug info\n"
-				"\nDefault TAR backup always probes known paths for comprehensive coverage.\n"
-				"Use --quick to skip probing for fast tree-walk-only backup.\n"
-				"Use -x for QPST-compatible XQCN format (slower, scans NV items).\n"
-				"\nIf [path] is given, only that EFS subtree is backed up (default: /)\n");
-			return opt == 'h' ? 0 : 1;
+			print_efsbackup_help(stderr);
+			return 1;
 		}
 	}
 
@@ -3337,6 +3847,25 @@ static bool file_starts_with_xml(const char *path)
 	return r == 5 && memcmp(buf, "<?xml", 5) == 0;
 }
 
+static void print_efsrestore_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s efsrestore <input.tar|input.xqcn> [options]\n", __progname);
+	fprintf(out, "\nRestore EFS filesystem from a TAR archive or XQCN file.\n");
+	fprintf(out, "Format is auto-detected from file contents.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info (QPST-style per-item status)\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nXQCN restore phases: NV items -> sync -> Provisioning -> EFS_Backup\n");
+	fprintf(out, "  -> NV_Items -> device reboot.\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s efsrestore efs_backup.tar\n", __progname);
+	fprintf(out, "  %s efsrestore backup.xqcn\n", __progname);
+	fprintf(out, "  %s efsrestore backup.xqcn -d\n", __progname);
+}
+
 static int qdl_efsrestore(int argc, char **argv)
 {
 	struct diag_session *sess;
@@ -3364,12 +3893,11 @@ static int qdl_efsrestore(int argc, char **argv)
 			serial = optarg;
 			break;
 		case 'h':
+			print_efsrestore_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr,
-				"Usage: qfenix efsrestore <input.tar|input.xqcn> [--serial=S]\n"
-				"\nRestore EFS filesystem from a TAR archive or XQCN file.\n"
-				"Format is auto-detected from file contents.\n");
-			return opt == 'h' ? 0 : 1;
+			print_efsrestore_help(stderr);
+			return 1;
 		}
 	}
 
@@ -3383,26 +3911,34 @@ static int qdl_efsrestore(int argc, char **argv)
 		return 1;
 
 	if (file_starts_with_xml(argv[optind])) {
-		/* XQCN restore manages offline mode internally */
+		/* XQCN restore manages offline/sync/reboot internally */
 		ret = diag_efs_restore_xqcn(sess, argv[optind]);
 	} else {
 		diag_offline(sess);
 		ret = diag_efs_restore(sess, argv[optind]);
-		diag_online(sess);
 	}
 
 	diag_close(sess);
 	return !!ret;
 }
 
+static void print_xqcn2tar_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s xqcn2tar <input.xqcn> [output.tar]\n", __progname);
+	fprintf(out, "\nConvert XQCN backup to TAR archive (offline, no device needed).\n");
+	fprintf(out, "NV items are stored as nv_items/NNNNN.bin in the TAR.\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s xqcn2tar backup.xqcn\n", __progname);
+	fprintf(out, "  %s xqcn2tar backup.xqcn my_backup.tar\n", __progname);
+}
+
 static int qdl_xqcn2tar(int argc, char **argv)
 {
 	if (argc < 2 || strcmp(argv[1], "-h") == 0 ||
 	    strcmp(argv[1], "--help") == 0) {
-		fprintf(argc < 2 ? stderr : stdout,
-			"Usage: qfenix xqcn2tar <input.xqcn> [output.tar]\n"
-			"\nConvert XQCN backup to TAR archive (offline, no device needed).\n"
-			"NV items are stored as nv_items/NNNNN.bin in the TAR.\n");
+		print_xqcn2tar_help(argc < 2 ? stderr : stdout);
 		return argc < 2 ? 1 : 0;
 	}
 
@@ -3412,14 +3948,23 @@ static int qdl_xqcn2tar(int argc, char **argv)
 	return !!diag_xqcn_to_tar(input, output);
 }
 
+static void print_tar2xqcn_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s tar2xqcn <input.tar> [output.xqcn]\n", __progname);
+	fprintf(out, "\nConvert TAR archive to XQCN format (offline, no device needed).\n");
+	fprintf(out, "TAR entries under nv_items/ are converted to NV_ITEM_ARRAY.\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s tar2xqcn backup.tar\n", __progname);
+	fprintf(out, "  %s tar2xqcn backup.tar my_backup.xqcn\n", __progname);
+}
+
 static int qdl_tar2xqcn(int argc, char **argv)
 {
 	if (argc < 2 || strcmp(argv[1], "-h") == 0 ||
 	    strcmp(argv[1], "--help") == 0) {
-		fprintf(argc < 2 ? stderr : stdout,
-			"Usage: qfenix tar2xqcn <input.tar> [output.xqcn]\n"
-			"\nConvert TAR archive to XQCN format (offline, no device needed).\n"
-			"TAR entries under nv_items/ are converted to NV_ITEM_ARRAY.\n");
+		print_tar2xqcn_help(argc < 2 ? stderr : stdout);
 		return argc < 2 ? 1 : 0;
 	}
 
@@ -3429,9 +3974,31 @@ static int qdl_tar2xqcn(int argc, char **argv)
 	return !!diag_tar_to_xqcn(input, output);
 }
 
+static void print_erase_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s erase [-L dir | <programmer>] <label> [label2 ...] [options]\n", __progname);
+	fprintf(out, "       %s erase [-L dir | <programmer>] --start-sector=N --num-sectors=N [options]\n", __progname);
+	fprintf(out, "\nErase partitions by label, or erase raw sectors by address.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -a, --start-sector=N  Start sector for raw erase\n");
+	fprintf(out, "  -n, --num-sectors=N   Number of sectors to erase\n");
+	fprintf(out, "  -s, --storage=T       Storage type: emmc|nand|ufs (default: nand)\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -L, --find-loader=DIR Find programmer in directory\n");
+	fprintf(out, "  -P, --pcie            Use PCIe/MHI transport\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s erase modem\n", __progname);
+	fprintf(out, "  %s erase sbl1 tz rpm\n", __progname);
+	fprintf(out, "  %s erase --start-sector=0 --num-sectors=1024\n", __progname);
+}
+
 static int qdl_erase(int argc, char **argv)
 {
-	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
+	enum qdl_storage_type storage_type = QDL_STORAGE_NAND;
 	struct qdl_device *qdl = NULL;
 	char *loader_dir = NULL;
 	char *programmer = NULL;
@@ -3490,20 +4057,11 @@ static int qdl_erase(int argc, char **argv)
 			raw_mode = true;
 			break;
 		case 'h':
+			print_erase_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr,
-				"Usage: qfenix erase [-L dir | <programmer>] <label> [label2 ...] [options]\n"
-				"       qfenix erase [-L dir | <programmer>] --start-sector=N --num-sectors=N [options]\n"
-				"\nErase partitions by label, or erase raw sectors by address.\n"
-				"\nOptions:\n"
-				"  -a, --start-sector=N  Start sector for raw erase\n"
-				"  -n, --num-sectors=N   Number of sectors to erase\n"
-				"  -s, --storage=TYPE    Storage type (ufs, emmc, nand)\n"
-				"  -S, --serial=S        Target device by serial/port\n"
-				"  -L, --find-loader=DIR Find programmer in directory\n"
-				"  -P, --pcie            Use PCIe transport\n"
-				"  -d, --debug           Print detailed debug info\n");
-			return opt == 'h' ? 0 : 1;
+			print_erase_help(stderr);
+			return 1;
 		}
 	}
 
@@ -3568,9 +4126,27 @@ static int qdl_erase(int argc, char **argv)
 	return !!failed;
 }
 
+static void print_eraseall_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s eraseall [-L dir | <programmer>] [options]\n", __progname);
+	fprintf(out, "\nErase all partitions on the device.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "  -s, --storage=T       Storage type: emmc|nand|ufs (default: nand)\n");
+	fprintf(out, "  -S, --serial=S        Target by serial number or COM port\n");
+	fprintf(out, "  -L, --find-loader=DIR Find programmer in directory\n");
+	fprintf(out, "  -P, --pcie            Use PCIe/MHI transport\n");
+	fprintf(out, "  -d, --debug           Print detailed debug info\n");
+	fprintf(out, "  -h, --help            Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s eraseall\n", __progname);
+	fprintf(out, "  %s eraseall -L /path/to/loader/\n", __progname);
+}
+
 static int qdl_eraseall(int argc, char **argv)
 {
-	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
+	enum qdl_storage_type storage_type = QDL_STORAGE_NAND;
 	struct qdl_device *qdl = NULL;
 	char *loader_dir = NULL;
 	char *programmer = NULL;
@@ -3613,11 +4189,11 @@ static int qdl_eraseall(int argc, char **argv)
 			use_pcie = true;
 			break;
 		case 'h':
+			print_eraseall_help(stdout);
+			return 0;
 		default:
-			fprintf(stderr,
-				"Usage: qfenix eraseall [-L dir | <programmer>] [--serial=S] [--storage=T] [--pcie]\n"
-				"\nErase all partitions on the device.\n");
-			return opt == 'h' ? 0 : 1;
+			print_eraseall_help(stderr);
+			return 1;
 		}
 	}
 
@@ -3649,9 +4225,45 @@ static int qdl_eraseall(int argc, char **argv)
 	return !!ret;
 }
 
+static void print_flash_help(FILE *out)
+{
+	extern const char *__progname;
+
+	fprintf(out, "Usage: %s flash [options] [directory]\n", __progname);
+	fprintf(out, "       %s [options] -F <firmware-dir>\n", __progname);
+	fprintf(out, "       %s [options] <prog.mbn> <xml-files>...\n", __progname);
+	fprintf(out, "\nFlash firmware from a directory or individual XML files.\n");
+	fprintf(out, "If no directory is given, the current directory is searched.\n");
+	fprintf(out, "\nOptions:\n");
+	fprintf(out, "      --log=FILE            Write debug-level log to FILE\n");
+	fprintf(out, "  -d, --debug               Print detailed debug info\n");
+	fprintf(out, "  -n, --dry-run             Dry run, no device reading or flashing\n");
+	fprintf(out, "  -e, --erase-all           Erase all partitions before programming\n");
+	fprintf(out, "  -f, --allow-missing       Allow skipping of missing files\n");
+	fprintf(out, "  -s, --storage=T           Storage type: emmc|nand|nvme|spinor|ufs (default: nand)\n");
+	fprintf(out, "  -l, --finalize-provisioning  Provision the target storage\n");
+	fprintf(out, "  -i, --include=T           Set folder to search for files\n");
+	fprintf(out, "  -S, --serial=T            Target by serial number or COM port\n");
+	fprintf(out, "  -u, --out-chunk-size=T    Override chunk size for transactions\n");
+	fprintf(out, "  -t, --create-digests=T    Generate VIP digest table in folder\n");
+	fprintf(out, "  -T, --slot=T              Set slot number for multiple storage devices\n");
+	fprintf(out, "  -D, --vip-table-path=T    Use VIP digest tables from folder\n");
+	fprintf(out, "  -E, --no-auto-edl         Disable automatic DIAG to EDL switching\n");
+	fprintf(out, "  -M, --skip-md5            Skip MD5 verification of firmware files\n");
+	fprintf(out, "  -F, --firmware-dir=T      Auto-detect firmware from directory\n");
+	fprintf(out, "  -L, --find-loader=T       Auto-detect programmer/loader from directory\n");
+	fprintf(out, "  -P, --pcie                Use PCIe/MHI transport\n");
+	fprintf(out, "  -h, --help                Print this help\n");
+	fprintf(out, "\nExamples:\n");
+	fprintf(out, "  %s flash /path/to/firmware/\n", __progname);
+	fprintf(out, "  %s flash -e /path/to/firmware/       Erase-all + flash\n", __progname);
+	fprintf(out, "  %s -F /path/to/firmware/\n", __progname);
+	fprintf(out, "  %s prog_firehose_ddr.elf rawprogram*.xml patch*.xml\n", __progname);
+}
+
 static int qdl_flash(int argc, char **argv)
 {
-	enum qdl_storage_type storage_type = QDL_STORAGE_UFS;
+	enum qdl_storage_type storage_type = QDL_STORAGE_NAND;
 	struct sahara_image sahara_images[MAPPING_SZ] = {};
 	struct firmware_files fw = {};
 	char *incdir = NULL;
@@ -3696,6 +4308,7 @@ static int qdl_flash(int argc, char **argv)
 		{"pcie", no_argument, 0, 'P'},
 		{"erase-all", no_argument, 0, 'e'},
 		{"help", no_argument, 0, 'h'},
+		{"help-all", no_argument, 0, 'H'},
 		{0, 0, 0, 0}
 	};
 
@@ -3762,10 +4375,13 @@ static int qdl_flash(int argc, char **argv)
 			erase_all = true;
 			break;
 		case 'h':
-			print_usage(stdout);
+			print_flash_help(stdout);
+			return 0;
+		case 'H':
+			print_all_help(stdout);
 			return 0;
 		default:
-			print_usage(stderr);
+			print_flash_help(stderr);
 			return 1;
 		}
 	}
@@ -3804,7 +4420,7 @@ static int qdl_flash(int argc, char **argv)
 			return 1;
 		}
 	} else if ((optind + 2) > argc) {
-		print_usage(stderr);
+		print_flash_help(stderr);
 		return 1;
 	}
 
@@ -4038,69 +4654,340 @@ out_cleanup:
 	return !!ret;
 }
 
+static void print_all_help(FILE *out)
+{
+	print_usage(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== flash ==========");
+	fprintf(out, "\n");
+	print_flash_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== printgpt ==========");
+	fprintf(out, "\n");
+	print_printgpt_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== storageinfo ==========");
+	fprintf(out, "\n");
+	print_storageinfo_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== reset ==========");
+	fprintf(out, "\n");
+	print_reset_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== getslot ==========");
+	fprintf(out, "\n");
+	print_getslot_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== setslot ==========");
+	fprintf(out, "\n");
+	print_setslot_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== read ==========");
+	fprintf(out, "\n");
+	print_read_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== readall ==========");
+	fprintf(out, "\n");
+	print_readall_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== erase ==========");
+	fprintf(out, "\n");
+	print_erase_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== eraseall ==========");
+	fprintf(out, "\n");
+	print_eraseall_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== diag2edl ==========");
+	fprintf(out, "\n");
+	print_diag2edl_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== nvread ==========");
+	fprintf(out, "\n");
+	print_nvread_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== nvwrite ==========");
+	fprintf(out, "\n");
+	print_nvwrite_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== efsbackup ==========");
+	fprintf(out, "\n");
+	print_efsbackup_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== efsrestore ==========");
+	fprintf(out, "\n");
+	print_efsrestore_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== efspull ==========");
+	fprintf(out, "\n");
+	print_efspull_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== efspush ==========");
+	fprintf(out, "\n");
+	print_efspush_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== efsls ==========");
+	fprintf(out, "\n");
+	print_efsls_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== efsrm ==========");
+	fprintf(out, "\n");
+	print_efsrm_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== efsstat ==========");
+	fprintf(out, "\n");
+	print_efsstat_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== efsmkdir ==========");
+	fprintf(out, "\n");
+	print_efsmkdir_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== efschmod ==========");
+	fprintf(out, "\n");
+	print_efschmod_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== efsln ==========");
+	fprintf(out, "\n");
+	print_efsln_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== efsrl ==========");
+	fprintf(out, "\n");
+	print_efsrl_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== efsdump ==========");
+	fprintf(out, "\n");
+	print_efsdump_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== xqcn2tar ==========");
+	fprintf(out, "\n");
+	print_xqcn2tar_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== tar2xqcn ==========");
+	fprintf(out, "\n");
+	print_tar2xqcn_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== list ==========");
+	fprintf(out, "\n");
+	print_list_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== ramdump ==========");
+	fprintf(out, "\n");
+	print_ramdump_help(out);
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN,
+		       "========== ks ==========");
+	fprintf(out, "\n");
+	print_ks_help(out);
+}
+
+static void print_fenix_art(FILE *out)
+{
+	const char *art =
+		"                             .*@@@-.\n"
+		"                                  :@@@@-\n"
+		"                                     @@@@#.\n"
+		"      .+-                               #@@@@%.+@-\n"
+		"    -@*@*@%                                @@@@@::@@=\n"
+		".+%@@@@@@@@@%=.                            =@@@@# #@@- ..\n"
+		"    .@@@@@:                                :@@@@@ =@@@..%=\n"
+		"      .%-                                  -@@@@@:=@@@@  @@#\n"
+		"      .#-         .%@@@@@@#.               +@@@@@.#@@@@  @@@.\n"
+		"       :.             .%@@@@@@@@@@@%.     .@@@@@+:@@@@@  @@@-\n"
+		"                        -@@@@@@@@@@@@@@@..@@@@@@.-@@@@@ .@@@-\n"
+		"                          =@@@@@@@@*  .@@@@@@. @@@@@@..@@@@-\n"
+		"                           @@@@@@:.-@@@@@@.  @@@@@@= %@@@@@.\n"
+		"                          .@@@@. *@@@@@@- .+@@@@@@-.@@@@@@+\n"
+		"                          %@@. =@@@@@*.  +@@@@@@%.-@@@@@@%\n"
+		"                         =@.+@@@@@. -@@@@@@@*.:@@@@@@@*.\n"
+		"                          ..@@@@= .@@@@@@: #@@@@@@@:\n"
+		"                           .@@@@  +@@@@..%@@@@@+.\n"
+		"                            @@@.  @@@. @@@*    .@.\n"
+		"                         -*: .@@* :@@. @@.  -..@@\n"
+		"                       =@@@@@@.*@- :@%  @* =@:=@#\n"
+		"                      .@@@-+@@@@:%@..%- ...@%:@@:\n"
+		"                       :@@ :+   *@     *@@#*@@@.\n"
+		"                                  .*@@@:=@@@@:\n"
+		"                            .@@@@#.-@@@@@.\n"
+		"                         -@@@@@  @@@@@@%\n"
+		"                        :@@@@# =@@@@@@%\n"
+		"                         #@@@. @@@@@@*\n"
+		"                              :@@@@@=\n"
+		"                                   .=@@@@@-\n";
+
+	fprintf(out, "\n");
+	ux_fputs_color(out, UX_COLOR_BOLD UX_COLOR_GREEN, art);
+	fprintf(out, "\n");
+}
+
 int main(int argc, char **argv)
 {
+	int ret;
+
 	ux_init();
 
-	if (argc >= 2 && !strcmp(argv[1], "list"))
-		return qdl_list(stdout);
-	if (argc >= 2 && !strcmp(argv[1], "ramdump"))
-		return qdl_ramdump(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "ks"))
-		return qdl_ks(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "diag2edl"))
-		return qdl_diag2edl(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "printgpt"))
-		return qdl_printgpt(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "storageinfo"))
-		return qdl_storageinfo(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "reset"))
-		return qdl_reset(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "getslot"))
-		return qdl_getslot(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "setslot"))
-		return qdl_setslot(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "read"))
-		return qdl_read_partition(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "readall"))
-		return qdl_readall(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "erase"))
-		return qdl_erase(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "eraseall"))
-		return qdl_eraseall(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "nvread"))
-		return qdl_nvread(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "nvwrite"))
-		return qdl_nvwrite(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "efsls"))
-		return qdl_efsls(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "efspull"))
-		return qdl_efspull(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "efspush"))
-		return qdl_efspush(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "efsrm"))
-		return qdl_efsrm(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "efsstat"))
-		return qdl_efsstat(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "efsmkdir"))
-		return qdl_efsmkdir(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "efschmod"))
-		return qdl_efschmod(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "efsln"))
-		return qdl_efsln(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "efsrl"))
-		return qdl_efsrl(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "efsdump"))
-		return qdl_efsdump(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "efsbackup"))
-		return qdl_efsbackup(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "efsrestore"))
-		return qdl_efsrestore(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "xqcn2tar"))
-		return qdl_xqcn2tar(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "tar2xqcn"))
-		return qdl_tar2xqcn(argc - 1, argv + 1);
-	if (argc >= 2 && !strcmp(argv[1], "flash")) {
+	/* Pre-scan for --log=<file> (global option, works with all subcommands) */
+	for (int i = 1; i < argc; i++) {
+		const char *log_path = NULL;
+		int strip = 0;
+
+		if (!strncmp(argv[i], "--log=", 6)) {
+			log_path = argv[i] + 6;
+			strip = 1;
+		} else if (!strcmp(argv[i], "--log") && i + 1 < argc) {
+			log_path = argv[i + 1];
+			strip = 2;
+		}
+
+		if (log_path) {
+			qdl_log_file = fopen(log_path, "w");
+			if (!qdl_log_file) {
+				fprintf(stderr, "Error: cannot open log file: %s\n",
+					log_path);
+				return 1;
+			}
+			/* Strip --log arg(s) so subcommands don't see them */
+			for (int j = i; j + strip < argc; j++)
+				argv[j] = argv[j + strip];
+			argc -= strip;
+			break;
+		}
+	}
+
+	/* Handle no args, --help, --help-all, -h before subcommand dispatch */
+	if (argc < 2 || !strcmp(argv[1], "--help") ||
+	    !strcmp(argv[1], "-h")) {
+		print_usage(argc < 2 ? stderr : stdout);
+		return argc < 2 ? 1 : 0;
+	}
+	if (!strcmp(argv[1], "--help-all")) {
+		print_all_help(stdout);
+		return 0;
+	}
+
+	/* list: handle --help since it has no getopt loop */
+	if (!strcmp(argv[1], "list")) {
+		if (argc >= 3 && (!strcmp(argv[2], "--help") ||
+				  !strcmp(argv[2], "-h"))) {
+			print_list_help(stdout);
+			return 0;
+		}
+		ret = qdl_list(stdout);
+	} else if (!strcmp(argv[1], "ramdump")) {
+		ret = qdl_ramdump(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "ks")) {
+		ret = qdl_ks(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "diag2edl")) {
+		ret = qdl_diag2edl(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "printgpt")) {
+		ret = qdl_printgpt(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "storageinfo")) {
+		ret = qdl_storageinfo(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "reset")) {
+		ret = qdl_reset(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "getslot")) {
+		ret = qdl_getslot(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "setslot")) {
+		ret = qdl_setslot(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "read")) {
+		ret = qdl_read_partition(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "readall")) {
+		ret = qdl_readall(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "erase")) {
+		ret = qdl_erase(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "eraseall")) {
+		ret = qdl_eraseall(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "nvread")) {
+		ret = qdl_nvread(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "nvwrite")) {
+		ret = qdl_nvwrite(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "efsls")) {
+		ret = qdl_efsls(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "efspull")) {
+		ret = qdl_efspull(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "efspush")) {
+		ret = qdl_efspush(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "efsrm")) {
+		ret = qdl_efsrm(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "efsstat")) {
+		ret = qdl_efsstat(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "efsmkdir")) {
+		ret = qdl_efsmkdir(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "efschmod")) {
+		ret = qdl_efschmod(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "efsln")) {
+		ret = qdl_efsln(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "efsrl")) {
+		ret = qdl_efsrl(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "efsdump")) {
+		ret = qdl_efsdump(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "efsbackup")) {
+		ret = qdl_efsbackup(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "efsrestore")) {
+		ret = qdl_efsrestore(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "xqcn2tar")) {
+		ret = qdl_xqcn2tar(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "tar2xqcn")) {
+		ret = qdl_tar2xqcn(argc - 1, argv + 1);
+	} else if (!strcmp(argv[1], "flash")) {
 		/*
 		 * "qfenix flash [options] [dir]" — treat bare positional
 		 * arg as firmware directory (like -F).  If no dir given,
@@ -4109,25 +4996,15 @@ int main(int argc, char **argv)
 		int flash_argc = argc - 1;
 		char **flash_argv = argv + 1;
 
-		/* Check for --help before rewriting args */
+		/* Check for --help / --help-all before rewriting args */
 		for (int i = 1; i < flash_argc; i++) {
+			if (!strcmp(flash_argv[i], "--help-all")) {
+				print_all_help(stdout);
+				return 0;
+			}
 			if (!strcmp(flash_argv[i], "--help") ||
 			    !strcmp(flash_argv[i], "-h")) {
-				fprintf(stdout,
-					"Usage: qfenix flash [options] [directory]\n"
-					"\nFlash firmware from a directory. If no directory is given,\n"
-					"the current directory is searched for a programmer and XML files.\n"
-					"\nThis is equivalent to: qfenix -F <directory>\n"
-					"\nOptions:\n"
-					"  -d, --debug               Print detailed debug info\n"
-					"  -s, --storage=T           Set storage type: emmc|nand|nvme|spinor|ufs\n"
-					"  -S, --serial=T            Target by serial number or COM port name\n"
-					"  -f, --allow-missing       Allow skipping of missing files\n"
-					"  -M, --skip-md5            Skip MD5 verification\n"
-					"  -E, --no-auto-edl         Disable automatic DIAG to EDL switching\n"
-					"  -e, --erase-all           Erase all partitions before programming\n"
-					"  -P, --pcie                Use PCIe/MHI transport\n"
-					"  -h, --help                Print this help\n");
+				print_flash_help(stdout);
 				return 0;
 			}
 		}
@@ -4171,13 +5048,22 @@ int main(int argc, char **argv)
 			}
 			new_argv[n] = NULL;
 
-			int ret = qdl_flash(n, new_argv);
+			ret = qdl_flash(n, new_argv);
 			free(new_argv);
-			return ret;
+		} else {
+			ret = qdl_flash(flash_argc, flash_argv);
 		}
-
-		return qdl_flash(flash_argc, flash_argv);
+	} else {
+		ret = qdl_flash(argc, argv);
 	}
 
-	return qdl_flash(argc, argv);
+	if (!ret)
+		print_fenix_art(stdout);
+
+	if (qdl_log_file) {
+		fclose(qdl_log_file);
+		qdl_log_file = NULL;
+	}
+
+	return ret;
 }

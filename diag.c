@@ -67,7 +67,8 @@ static int diag_detect_port(char *port_buf, size_t buf_size,
 		return 0;
 
 	while ((de = readdir(busdir)) != NULL && !found) {
-		int vid = 0, pid = 0;
+		int major = 0, vid = 0, pid = 0;
+		char devtype[64] = {0}, product[64] = {0};
 		char dev_serial[128] = {0};
 		int diag_iface;
 
@@ -81,14 +82,24 @@ static int diag_detect_port(char *port_buf, size_t buf_size,
 			continue;
 
 		while (fgets(line, sizeof(line), fp)) {
-			line[strcspn(line, "\n")] = 0;
-			if (strncmp(line, "PRODUCT=", 8) == 0)
-				sscanf(line + 8, "%x/%x", &vid, &pid);
+			line[strcspn(line, "\r\n")] = 0;
+			if (strncmp(line, "MAJOR=", 6) == 0)
+				major = atoi(line + 6);
+			else if (strncmp(line, "DEVTYPE=", 8) == 0)
+				snprintf(devtype, sizeof(devtype),
+					 "%.63s", line + 8);
+			else if (strncmp(line, "PRODUCT=", 8) == 0)
+				snprintf(product, sizeof(product),
+					 "%.63s", line + 8);
 		}
 		fclose(fp);
 
-		if (!vid)
+		/* Only match USB device entries (not interfaces) */
+		if (major != 189 ||
+		    strncmp(devtype, "usb_device", 10) != 0)
 			continue;
+
+		sscanf(product, "%x/%x", &vid, &pid);
 
 		/* Only match known DIAG-capable vendors */
 		if (!is_diag_vendor(vid))
@@ -98,20 +109,21 @@ static int diag_detect_port(char *port_buf, size_t buf_size,
 		if (is_edl_device(vid, pid))
 			continue;
 
-		/* Read serial number if available */
-		snprintf(path, sizeof(path), "%s/%s/serial",
-			 base, de->d_name);
-		fp = fopen(path, "r");
-		if (fp) {
-			if (fgets(dev_serial, sizeof(dev_serial), fp))
-				dev_serial[strcspn(dev_serial, "\n")] = 0;
-			fclose(fp);
+		/* Read serial number if filter is specified */
+		if (serial) {
+			snprintf(path, sizeof(path), "%s/%s/serial",
+				 base, de->d_name);
+			fp = fopen(path, "r");
+			if (fp) {
+				if (fgets(dev_serial, sizeof(dev_serial), fp))
+					dev_serial[strcspn(dev_serial,
+							   "\r\n")] = 0;
+				fclose(fp);
+			}
+			if (dev_serial[0] &&
+			    strcmp(dev_serial, serial) != 0)
+				continue;
 		}
-
-		/* Filter by serial if specified */
-		if (serial && serial[0] && dev_serial[0] &&
-		    strcmp(serial, dev_serial) != 0)
-			continue;
 
 		/* Try the known DIAG interface first */
 		diag_iface = get_diag_interface_num(vid, pid);
@@ -119,9 +131,9 @@ static int diag_detect_port(char *port_buf, size_t buf_size,
 			 base, de->d_name, diag_iface);
 		infdir = opendir(path);
 
-		/* Fall back to scanning all interfaces */
+		/* Fall back to interface 0 */
 		if (!infdir) {
-			snprintf(path, sizeof(path), "%s/%s",
+			snprintf(path, sizeof(path), "%s/%s:1.0",
 				 base, de->d_name);
 			infdir = opendir(path);
 		}
@@ -129,27 +141,44 @@ static int diag_detect_port(char *port_buf, size_t buf_size,
 			continue;
 
 		while ((de2 = readdir(infdir)) != NULL && !found) {
-			char subpath[1024];
-			DIR *ttydir;
-			struct dirent *de3;
-
-			snprintf(subpath, sizeof(subpath),
-				 "%s/%s/tty", path, de2->d_name);
-			ttydir = opendir(subpath);
-			if (!ttydir)
-				continue;
-
-			while ((de3 = readdir(ttydir)) != NULL) {
-				if (strncmp(de3->d_name, "ttyUSB", 6) == 0 ||
-				    strncmp(de3->d_name, "ttyACM", 6) == 0) {
-					snprintf(port_buf, buf_size,
-						 "/dev/%.240s",
-						 de3->d_name);
-					found = 1;
-					break;
-				}
+			/* Check for ttyUSB directly in interface dir */
+			if (strncmp(de2->d_name, "ttyUSB", 6) == 0) {
+				snprintf(port_buf, buf_size, "/dev/%s",
+					 de2->d_name);
+				found = 1;
+				break;
 			}
-			closedir(ttydir);
+
+			/* Check for tty/ subdirectory */
+			if (strncmp(de2->d_name, "tty", 3) == 0 &&
+			    strlen(de2->d_name) == 3) {
+				char ttypath[520];
+				DIR *ttydir;
+				struct dirent *de3;
+
+				snprintf(ttypath, sizeof(ttypath),
+					 "%.511s/tty", path);
+				ttydir = opendir(ttypath);
+				if (!ttydir)
+					continue;
+
+				while ((de3 = readdir(ttydir))) {
+					if (strncmp(de3->d_name,
+						    "ttyUSB", 6) == 0 ||
+					    strncmp(de3->d_name,
+						    "ttyACM", 6) == 0) {
+						snprintf(port_buf,
+							 buf_size,
+							 "/dev/%.240s",
+							 de3->d_name);
+						found = 1;
+						break;
+					}
+				}
+				closedir(ttydir);
+				if (found)
+					break;
+			}
 		}
 		closedir(infdir);
 	}
@@ -2506,6 +2535,9 @@ int diag_efs_restore(struct diag_session *sess, const char *tar_file)
 	int files_restored = 0;
 	int dirs_created = 0;
 	int links_created = 0;
+	int nv_written = 0;
+	int nv_skipped = 0;
+	bool nv_synced = false;
 
 	if (!sess->efs_detected) {
 		n = diag_efs_detect(sess);
@@ -2580,10 +2612,75 @@ int diag_efs_restore(struct diag_session *sess, const char *tar_file)
 		case '0': /* Regular file */
 		case '\0': /* Regular file (old TAR) */
 		{
+			unsigned long tar_blocks = (size + 511) / 512;
+
+			/*
+			 * NV items stored as nv_items/NNNNN.bin by xqcn2tar.
+			 * Restore via diag_nv_write(), not as EFS files.
+			 */
+			if (strncmp(name, "nv_items/", 9) == 0 &&
+			    size == NV_ITEM_DATA_SIZE) {
+				uint32_t nv_id;
+				uint8_t nv_data[NV_ITEM_DATA_SIZE];
+				ssize_t r;
+				long pad;
+
+				if (sscanf(name + 9, "%u", &nv_id) != 1) {
+					lseek(fd, tar_blocks * 512, SEEK_CUR);
+					break;
+				}
+
+				r = read(fd, nv_data, NV_ITEM_DATA_SIZE);
+				if (r != NV_ITEM_DATA_SIZE) {
+					ux_err("read NV data from TAR failed\n");
+					ret = -1;
+					break;
+				}
+
+				pad = (long)(tar_blocks * 512 -
+					     NV_ITEM_DATA_SIZE);
+				if (pad > 0)
+					lseek(fd, pad, SEEK_CUR);
+
+				if (nv_item_excluded((uint16_t)nv_id)) {
+					nv_skipped++;
+					ux_debug("NV %u: skipped (excluded)\n",
+						 nv_id);
+					break;
+				}
+
+				n = diag_nv_write(sess, (uint16_t)nv_id,
+						  nv_data, NV_ITEM_DATA_SIZE);
+				if (n == 0) {
+					nv_written++;
+					ux_debug("restored %s (%lu bytes)\n",
+						 name, size);
+				} else if (n > 0) {
+					nv_skipped++;
+					ux_debug("NV %u: %s\n", nv_id,
+						 diag_nv_status_str(n));
+				} else {
+					nv_skipped++;
+					ux_debug("NV %u: write failed\n",
+						 nv_id);
+				}
+				break;
+			}
+
+			/*
+			 * Sync EFS journal after NV items before writing
+			 * EFS files, to reclaim space from NV writes.
+			 */
+			if (nv_written > 0 && !nv_synced) {
+				ux_info("  NV items: %d written, %d skipped\n",
+					nv_written, nv_skipped);
+				efs_sync(sess);
+				nv_synced = true;
+			}
+
 			bool item = ((mode & 0170000) == EFS_S_IFITM) ||
 				    is_item_path(efs_path);
 			int16_t perm = (int16_t)(mode & 0x1FF);
-			unsigned long tar_blocks = (size + 511) / 512;
 
 			/* Small files: buffer and use efs_write_file */
 			if (size <= 2048) {
@@ -2618,10 +2715,23 @@ int diag_efs_restore(struct diag_session *sess, const char *tar_file)
 			/* Large files: open/write/close */
 			efs_mkdirp(sess, efs_path);
 
-			int32_t fdata = efs_open(sess, efs_path,
+			int32_t flags = EFS_O_WRONLY | EFS_O_CREAT |
+					EFS_O_TRUNC;
+
+			if (item)
+				flags |= EFS_O_ITEMFILE;
+			else
+				flags |= EFS_O_AUTODIR;
+
+			int32_t fdata = efs_open(sess, efs_path, flags,
+						 (int32_t)perm);
+			if (fdata < 0 && item) {
+				/* Retry without ITEMFILE */
+				fdata = efs_open(sess, efs_path,
 						 EFS_O_WRONLY | EFS_O_CREAT |
 						 EFS_O_TRUNC | EFS_O_AUTODIR,
 						 (int32_t)perm);
+			}
 			if (fdata < 0) {
 				ux_warn("failed to create file '%s'\n",
 					efs_path);
@@ -2645,7 +2755,7 @@ int diag_efs_restore(struct diag_session *sess, const char *tar_file)
 
 				int w = efs_write(sess, fdata, offset,
 						  data, (uint32_t)r);
-				if (w < 0) {
+				if (w <= 0 || (size_t)w > remaining) {
 					ux_err("EFS write failed at offset %u\n",
 					       offset);
 					ret = -1;
@@ -2708,11 +2818,18 @@ int diag_efs_restore(struct diag_session *sess, const char *tar_file)
 
 	close(fd);
 
-	if (ret == 0)
-		ux_info("EFS restore complete: %d files, %d dirs, %d symlinks\n",
+	if (ret == 0) {
+		if (nv_written > 0 && !nv_synced)
+			ux_info("  NV items: %d written, %d skipped\n",
+				nv_written, nv_skipped);
+		ux_info("  EFS files: %d restored, %d dirs, %d symlinks\n",
 			files_restored, dirs_created, links_created);
-	else
+		ux_info("rebooting modem to apply changes...\n");
+		diag_set_mode(sess, DIAG_MODE_RESET);
+	} else {
 		ux_err("EFS restore failed\n");
+		diag_set_mode(sess, DIAG_MODE_ONLINE);
+	}
 
 	return ret;
 }
@@ -2888,17 +3005,31 @@ int diag_efs_put(struct diag_session *sess, const char *local_path,
 	}
 
 	efs_mkdirp(sess, efs_path);
-	fdata = efs_open(sess, efs_path,
-			EFS_O_WRONLY | EFS_O_CREAT | EFS_O_TRUNC |
-			EFS_O_AUTODIR, 0644);
+
+	{
+		bool item = is_item_path(efs_path);
+		int32_t flags = EFS_O_WRONLY | EFS_O_CREAT | EFS_O_TRUNC;
+
+		if (item)
+			flags |= EFS_O_ITEMFILE;
+		else
+			flags |= EFS_O_AUTODIR;
+
+		fdata = efs_open(sess, efs_path, flags, 0644);
+		if (fdata < 0 && item)
+			fdata = efs_open(sess, efs_path,
+					 EFS_O_WRONLY | EFS_O_CREAT |
+					 EFS_O_TRUNC | EFS_O_AUTODIR, 0644);
+	}
 	if (fdata < 0) {
 		ux_err("cannot create EFS file '%s'\n", efs_path);
 		close(local_fd);
 		return -1;
 	}
 
-	ux_info("writing '%s' to EFS '%s' (%ld bytes)\n",
-		local_path, efs_path, (long)sb.st_size);
+	ux_info("writing '%s' to EFS '%s' (%ld bytes%s)\n",
+		local_path, efs_path, (long)sb.st_size,
+		is_item_path(efs_path) ? ", item file" : "");
 
 	while (offset < (uint32_t)sb.st_size) {
 		uint32_t chunk = (uint32_t)sb.st_size - offset;

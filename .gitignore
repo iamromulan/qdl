@@ -11,3 +11,4 @@ scripts
 .scripts/
 .claude/
 CLAUDE.md
+__pycache__

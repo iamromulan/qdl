@@ -34,6 +34,10 @@ static bool ux_color_stderr;
  * info:  used to inform the user about progress (mint green)
  * logs:  log prints from the device
  * debug: protocol logs
+ *
+ * When qdl_log_file is set, ALL levels (including log/debug) are
+ * written to the file regardless of qdl_debug, giving a full
+ * debug-level log without cluttering the terminal.
  */
 
 /* Clear ux_cur_line_length characters of the progress bar from the screen */
@@ -106,89 +110,126 @@ void ux_init(void)
 
 void ux_err(const char *fmt, ...)
 {
-	va_list ap;
+	va_list ap, ap_log;
 
 	ux_clear_line();
 
+	va_start(ap, fmt);
+	if (qdl_log_file)
+		va_copy(ap_log, ap);
+
 	if (ux_color_stderr)
 		fputs(UX_COLOR_RED, stderr);
-
-	va_start(ap, fmt);
 	vfprintf(stderr, fmt, ap);
-	va_end(ap);
-
 	if (ux_color_stderr)
 		fputs(UX_COLOR_RESET, stderr);
-
 	fflush(stderr);
+	va_end(ap);
+
+	if (qdl_log_file) {
+		fputs("[ERROR] ", qdl_log_file);
+		vfprintf(qdl_log_file, fmt, ap_log);
+		fflush(qdl_log_file);
+		va_end(ap_log);
+	}
 }
 
 void ux_warn(const char *fmt, ...)
 {
-	va_list ap;
+	va_list ap, ap_log;
 
 	ux_clear_line();
 
+	va_start(ap, fmt);
+	if (qdl_log_file)
+		va_copy(ap_log, ap);
+
 	if (ux_color_stderr)
 		fputs(UX_COLOR_YELLOW, stderr);
-
-	va_start(ap, fmt);
 	vfprintf(stderr, fmt, ap);
-	va_end(ap);
-
 	if (ux_color_stderr)
 		fputs(UX_COLOR_RESET, stderr);
-
 	fflush(stderr);
+	va_end(ap);
+
+	if (qdl_log_file) {
+		fputs("[WARN]  ", qdl_log_file);
+		vfprintf(qdl_log_file, fmt, ap_log);
+		fflush(qdl_log_file);
+		va_end(ap_log);
+	}
 }
 
 void ux_info(const char *fmt, ...)
 {
-	va_list ap;
+	va_list ap, ap_log;
 
 	ux_clear_line();
 
+	va_start(ap, fmt);
+	if (qdl_log_file)
+		va_copy(ap_log, ap);
+
 	if (ux_color_stdout)
 		fputs(UX_COLOR_GREEN, stdout);
-
-	va_start(ap, fmt);
 	vprintf(fmt, ap);
-	va_end(ap);
-
 	if (ux_color_stdout)
 		fputs(UX_COLOR_RESET, stdout);
-
 	fflush(stdout);
+	va_end(ap);
+
+	if (qdl_log_file) {
+		fputs("[INFO]  ", qdl_log_file);
+		vfprintf(qdl_log_file, fmt, ap_log);
+		fflush(qdl_log_file);
+		va_end(ap_log);
+	}
 }
 
 void ux_log(const char *fmt, ...)
 {
-	va_list ap;
-
-	if (!qdl_debug)
-		return;
-
-	ux_clear_line();
+	va_list ap, ap_log;
 
 	va_start(ap, fmt);
-	vprintf(fmt, ap);
+	if (qdl_log_file)
+		va_copy(ap_log, ap);
+
+	if (qdl_debug) {
+		ux_clear_line();
+		vprintf(fmt, ap);
+		fflush(stdout);
+	}
 	va_end(ap);
-	fflush(stdout);
+
+	if (qdl_log_file) {
+		fputs("[LOG]   ", qdl_log_file);
+		vfprintf(qdl_log_file, fmt, ap_log);
+		fflush(qdl_log_file);
+		va_end(ap_log);
+	}
 }
 
 void ux_debug(const char *fmt, ...)
 {
-	va_list ap;
-
-	if (!qdl_debug)
-		return;
-
-	ux_clear_line();
+	va_list ap, ap_log;
 
 	va_start(ap, fmt);
-	vprintf(fmt, ap);
+	if (qdl_log_file)
+		va_copy(ap_log, ap);
+
+	if (qdl_debug) {
+		ux_clear_line();
+		vprintf(fmt, ap);
+		fflush(stdout);
+	}
 	va_end(ap);
-	fflush(stdout);
+
+	if (qdl_log_file) {
+		fputs("[DEBUG] ", qdl_log_file);
+		vfprintf(qdl_log_file, fmt, ap_log);
+		fflush(qdl_log_file);
+		va_end(ap_log);
+	}
 }
 
 void ux_fputs_color(FILE *f, const char *color, const char *text)

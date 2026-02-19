@@ -15,7 +15,7 @@ VIP_TABLE_FILE=${VIP_PATH}/DigestsToSign.bin
 mkdir -p $VIP_PATH
 
 cd $FLAT_BUILD
-${REP_ROOT}/qfenix --dry-run --create-digests=${VIP_PATH} \
+${REP_ROOT}/qfenix --dry-run --storage ufs --create-digests=${VIP_PATH} \
         prog_firehose_ddr.elf rawprogram*.xml patch*.xml
 
 if command -v sha256sum >/dev/null 2>&1; then

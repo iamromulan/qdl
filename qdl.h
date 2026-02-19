@@ -169,6 +169,7 @@ int parse_storage_address(const char *address, int *physical_partition,
 
 extern bool qdl_debug;
 extern bool qdl_auto_edl;
+extern FILE *qdl_log_file;
 
 enum firehose_op_type {
 	OP_ERASE,
